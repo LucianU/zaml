@@ -5,6 +5,7 @@ dist/
 *.egg-info
 *.so
 .zig-cache/
+zig-out
 __pycache__
 .eggs
 wheelhouse
