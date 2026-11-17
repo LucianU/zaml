@@ -15,6 +15,14 @@ const PyError = error{PythonError};
 /// `zaml.YAMLError`, a subclass of `ValueError`.
 var yaml_error: ?*py.PyObject = null;
 
+// Python exports None and the built-in exceptions as data. On Windows, data
+// from a DLL must be read through its `__imp_` pointer, which translate-c does
+// not emit, so referencing `_Py_NoneStruct` or `PyExc_*` directly reads garbage.
+// Look these objects up through function calls at module load instead.
+var none_obj: ?*py.PyObject = null;
+var value_error: ?*py.PyObject = null;
+var type_error: ?*py.PyObject = null;
+
 // ---------------------------------------------------------------------------
 // Python entry points
 
@@ -73,7 +81,7 @@ fn parseSchema(name: []const u8) PyError!yaml.Schema {
     inline for (.{ "core", "yaml11", "json", "failsafe" }) |option| {
         if (std.mem.eql(u8, name, option)) return @field(yaml.Schema, option);
     }
-    py.PyErr_SetString(py.PyExc_ValueError, "schema must be 'core', 'yaml11', 'json' or 'failsafe'");
+    py.PyErr_SetString(value_error, "schema must be 'core', 'yaml11', 'json' or 'failsafe'");
     return error.PythonError;
 }
 
@@ -89,14 +97,14 @@ const Source = struct {
 
         const read = py.PyObject_GetAttrString(arg, "read") orelse {
             py.PyErr_Clear();
-            py.PyErr_SetString(py.PyExc_TypeError, "expected str, bytes or a file object with read()");
+            py.PyErr_SetString(type_error, "expected str, bytes or a file object with read()");
             return error.PythonError;
         };
         defer py.Py_DecRef(read);
         const data = try check(py.PyObject_CallNoArgs(read));
         errdefer py.Py_DecRef(data);
         const bytes = try borrowBytes(data) orelse {
-            py.PyErr_SetString(py.PyExc_TypeError, "read() must return str or bytes");
+            py.PyErr_SetString(type_error, "read() must return str or bytes");
             return error.PythonError;
         };
         return .{ .bytes = bytes, .owner = data };
@@ -213,9 +221,8 @@ fn check(obj: ?*py.PyObject) PyError!*py.PyObject {
 }
 
 fn none() *py.PyObject {
-    const obj: *py.PyObject = &py._Py_NoneStruct;
-    py.Py_IncRef(obj);
-    return obj;
+    py.Py_IncRef(none_obj);
+    return none_obj.?;
 }
 
 fn newString(s: []const u8) PyError!*py.PyObject {
@@ -225,9 +232,20 @@ fn newString(s: []const u8) PyError!*py.PyObject {
 // ---------------------------------------------------------------------------
 // Module definition (multi-phase initialisation, PEP 489)
 
+/// A new reference to a built-in object, e.g. `ValueError`.
+fn builtin(name: [*:0]const u8) ?*py.PyObject {
+    const builtins = py.PyImport_ImportModule("builtins") orelse return null;
+    defer py.Py_DecRef(builtins);
+    return py.PyObject_GetAttrString(builtins, name);
+}
+
 fn moduleExec(module: [*c]py.PyObject) callconv(.c) c_int {
+    // These references are kept for the life of the process.
+    if (none_obj == null) none_obj = py.Py_BuildValue("") orelse return -1;
+    if (value_error == null) value_error = builtin("ValueError") orelse return -1;
+    if (type_error == null) type_error = builtin("TypeError") orelse return -1;
     if (yaml_error == null) {
-        yaml_error = py.PyErr_NewException("zaml.YAMLError", py.PyExc_ValueError, null);
+        yaml_error = py.PyErr_NewException("zaml.YAMLError", value_error, null);
         if (yaml_error == null) return -1;
     }
     py.Py_IncRef(yaml_error);
