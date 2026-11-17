@@ -40,7 +40,9 @@ pub fn build(b: *std.Build) void {
         // Windows resolves symbols at link time, against the stable-ABI import library.
         const libdir = python_libdir orelse @panic("missing -Dpython-libdir on Windows");
         module.addLibraryPath(.{ .cwd_relative = libdir });
-        module.linkSystemLibrary("python3", .{});
+        // Skip pkg-config: other tools on the machine (e.g. Strawberry Perl on
+        // GitHub's Windows runners) can ship a python3.pc for a different Python.
+        module.linkSystemLibrary("python3", .{ .use_pkg_config = .no });
     }
 
     const lib = b.addLibrary(.{
