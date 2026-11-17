@@ -4,10 +4,14 @@ build/
 dist/
 *.egg-info
 *.so
-zig-cache/
+*.pyd
+.zig-cache/
+zig-out/
+zig-pkg/
 __pycache__
 .eggs
 wheelhouse
 .DS_Store
 .envrc
+.direnv/
 .python-version

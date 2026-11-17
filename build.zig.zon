@@ -1,0 +1,17 @@
+.{
+    .name = .zaml,
+    .version = "0.1.0",
+    .fingerprint = 0xf884066a5ee6571d,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .yaml = .{
+            .url = "git+https://github.com/sakakibara/yaml-zig#0e3e14ee481cf037bdb3191866219c03e8d7f8b5",
+            .hash = "yaml-0.6.0-MIhruLFyDQD5-booN_PovgXonR3rfFWAEeES1zEwLKyX",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

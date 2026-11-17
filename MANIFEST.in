@@ -1,0 +1,3 @@
+include build.zig build.zig.zon zaml.pyi
+recursive-include src *.zig *.h
+recursive-include tests *.py
