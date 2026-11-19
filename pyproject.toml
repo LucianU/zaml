@@ -17,7 +17,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/adamserafini/zaml"
+Homepage = "https://github.com/LucianU/zaml"
+Issues = "https://github.com/LucianU/zaml/issues"
+"Original project" = "https://github.com/adamserafini/zaml"
 
 [dependency-groups]
 dev = ["pytest", "pyyaml", "ruamel.yaml"]
