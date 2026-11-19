@@ -263,7 +263,7 @@ def test_json_and_failsafe_schemas():
 
 def test_unknown_schema_raises():
     with pytest.raises(ValueError, match="schema"):
-        zaml.load("a: 1", schema="yaml13")
+        zaml.load("a: 1", schema="yaml13")  # pyright: ignore[reportArgumentType]
 
 
 def test_file_objects(tmp_path):
@@ -281,7 +281,7 @@ def test_file_object_returning_wrong_type():
             return 42
 
     with pytest.raises(TypeError, match="read"):
-        zaml.load(Reader())
+        zaml.load(Reader())  # pyright: ignore[reportArgumentType]
 
 
 def test_yaml_error_is_value_error():
@@ -290,10 +290,128 @@ def test_yaml_error_is_value_error():
 
 def test_wrong_type_raises():
     with pytest.raises(TypeError):
-        zaml.load(42)
+        zaml.load(42)  # pyright: ignore[reportArgumentType]
 
 
 def test_matches_pyyaml_on_large_mapping():
     data = {f"a{i}": f"b{i + 1}" for i in range(10_000)}
     text = pyyaml.dump(data, Dumper=pyyaml.SafeDumper)
     assert zaml.load(text) == pyyaml.safe_load(text) == data
+
+
+# ---------------------------------------------------------------------------
+# Dumping
+
+import collections
+import datetime
+import io
+
+DUMP_CASES = [
+    None,
+    True,
+    0,
+    -17,
+    2**64,
+    -(2**127),
+    1.5,
+    float("inf"),
+    "plain",
+    "",
+    [],
+    {},
+    [1, [2, [3, []]], {}],
+    {"a": {"b": {"c": [1, 2, {"d": None}]}}},
+    {2: "int", 2.5: "float", True: "bool", None: "none", "s": "str"},
+    # Strings that would read back as something else unless quoted.
+    ["yes", "no", "on", "off", "true", "null", "~", "123", "0x1F", "1e3", ".inf", "1_000", "2026-11-19"],
+    # Strings with YAML syntax, whitespace and non-ASCII.
+    ["a: b", "- x", "#c", "&a", "*a", "!t", "|", ">", "{", "[", " lead", "trail ", "multi\nline\n", "tab\there", "café ☕"],
+]
+
+
+@pytest.mark.parametrize("data", DUMP_CASES, ids=range(len(DUMP_CASES)))
+def test_dump_round_trip(data):
+    text = zaml.dump(data)
+    assert zaml.load(text) == data
+    assert pyyaml.safe_load(text) == data
+
+
+def test_dump_output_shape():
+    assert zaml.dump({"name": "zaml", "tags": ["fast", "yaml"]}) == "name: zaml\ntags:\n  - fast\n  - yaml\n"
+
+
+def test_dump_keeps_order_unless_sorted():
+    data = {"b": 1, "a": 2}
+    assert zaml.dump(data) == "b: 1\na: 2\n"
+    assert zaml.dump(data, sort_keys=True) == "a: 2\nb: 1\n"
+
+
+def test_dump_indent():
+    assert zaml.dump({"a": {"b": 1}}, indent=4) == "a:\n    b: 1\n"
+    with pytest.raises(ValueError, match="indent"):
+        zaml.dump({}, indent=0)
+
+
+def test_dump_nan():
+    assert math.isnan(zaml.load(zaml.dump(float("nan"))))
+
+
+def test_dump_tuples_and_dict_subclasses():
+    data = collections.OrderedDict(a=(1, 2))
+    assert zaml.load(zaml.dump(data)) == {"a": [1, 2]}
+
+
+def test_dump_to_stream():
+    out = io.StringIO()
+    assert zaml.dump({"a": 1}, out) is None
+    assert out.getvalue() == "a: 1\n"
+
+
+def test_dump_all():
+    docs = [{"a": 1}, [2], "three"]
+    text = zaml.dump_all(docs)
+    assert text.count("---") == 2
+    assert zaml.load_all(text) == docs
+    assert list(pyyaml.safe_load_all(text)) == docs
+    assert zaml.dump_all(iter(docs)) == text
+    assert zaml.dump_all([]) == ""
+
+
+@pytest.mark.parametrize(
+    "data",
+    [{1, 2}, b"bytes", datetime.date(2026, 11, 19), object(), {"a": [complex(1, 2)]}],
+    ids=["set", "bytes", "date", "object", "nested-complex"],
+)
+def test_dump_unsupported_types(data):
+    with pytest.raises(TypeError, match="cannot dump"):
+        zaml.dump(data)
+
+
+def test_dump_collection_keys():
+    with pytest.raises(TypeError, match="mapping keys"):
+        zaml.dump({(1, 2): "tuple key"})
+
+
+def test_dump_self_reference():
+    data = []
+    data.append(data)
+    with pytest.raises(ValueError, match="contains itself"):
+        zaml.dump(data)
+
+
+def test_dump_too_deep():
+    data = []
+    for _ in range(200):
+        data = [data]
+    with pytest.raises(ValueError, match="nested"):
+        zaml.dump(data)
+
+
+def test_dump_huge_int():
+    with pytest.raises(ValueError, match="128 bits"):
+        zaml.dump(2**200)
+
+
+def test_dump_unencodable_string():
+    with pytest.raises(UnicodeEncodeError):
+        zaml.dump("\ud800")

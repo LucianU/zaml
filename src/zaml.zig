@@ -22,6 +22,9 @@ var yaml_error: ?*py.PyObject = null;
 var none_obj: ?*py.PyObject = null;
 var value_error: ?*py.PyObject = null;
 var type_error: ?*py.PyObject = null;
+var true_obj: ?*py.PyObject = null;
+var false_obj: ?*py.PyObject = null;
+var float_type: ?*py.PyObject = null;
 
 // ---------------------------------------------------------------------------
 // Python entry points
@@ -214,6 +217,172 @@ fn newInt(value: i128) PyError!*py.PyObject {
 }
 
 // ---------------------------------------------------------------------------
+// Dumping: Python objects -> yaml.Value -> YAML text
+
+fn dump(_: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
+    return dumpDocuments(args, kwargs, .first) catch null;
+}
+
+fn dumpAll(_: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
+    return dumpDocuments(args, kwargs, .all) catch null;
+}
+
+fn dumpDocuments(args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!*py.PyObject {
+    var data: ?*py.PyObject = null;
+    var stream: ?*py.PyObject = null;
+    var indent: py.Py_ssize_t = 2;
+    var sort_keys: c_int = 0;
+    var keywords = [_:null]?[*:0]const u8{ "", "stream", "indent", "sort_keys" };
+    if (py.PyArg_ParseTupleAndKeywords(args, kwargs, "O|O$np", @ptrCast(&keywords), &data, &stream, &indent, &sort_keys) == 0) {
+        return error.PythonError;
+    }
+    if (indent < 1 or indent > 16) {
+        py.PyErr_SetString(value_error, "indent must be between 1 and 16");
+        return error.PythonError;
+    }
+    if (stream == none_obj) stream = null;
+
+    // The GIL stays held throughout: the value tree borrows string data from
+    // the Python objects, which must not change or be freed until emitted.
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const options: yaml.EmitOptions = .{ .indent = @intCast(indent), .sort_keys = sort_keys != 0 };
+
+    const result = switch (mode) {
+        .first => yaml.emit(&out.writer, try toValue(arena, data.?, 0), options),
+        .all => yaml.emitStream(&out.writer, try toValues(arena, data.?), options),
+    };
+    result catch |err| return raiseDumpError(err);
+
+    const text = try newString(out.written());
+    if (stream) |s| {
+        defer py.Py_DecRef(text);
+        try writeTo(s, text);
+        return none();
+    }
+    return text;
+}
+
+fn toValues(arena: std.mem.Allocator, documents: *py.PyObject) PyError![]yaml.Value {
+    const iter = py.PyObject_GetIter(documents) orelse return error.PythonError;
+    defer py.Py_DecRef(iter);
+    var values: std.ArrayList(yaml.Value) = .empty;
+    while (py.PyIter_Next(iter)) |doc| {
+        defer py.Py_DecRef(doc);
+        values.append(arena, try toValue(arena, doc, 0)) catch return noMemory();
+    }
+    if (py.PyErr_Occurred() != null) return error.PythonError;
+    return values.items;
+}
+
+/// Matches the emitter's own limit; also stops data that contains itself.
+const max_dump_depth = 128;
+
+/// Converts a Python object to a yaml.Value. Calls no Python code, so the
+/// borrowed string data stays valid while the GIL is held.
+fn toValue(arena: std.mem.Allocator, obj: *py.PyObject, depth: usize) PyError!yaml.Value {
+    if (depth > max_dump_depth) {
+        py.PyErr_SetString(value_error, "data is nested more than 128 levels deep, or contains itself");
+        return error.PythonError;
+    }
+    if (obj == none_obj) return .null;
+    if (obj == true_obj) return .{ .bool = true };
+    if (obj == false_obj) return .{ .bool = false };
+    if (py.PyUnicode_Check(obj) != 0) return .{ .string = try utf8(obj) };
+    if (py.PyLong_Check(obj) != 0) return .{ .int = try toInt(obj) };
+    if (py.PyObject_IsInstance(obj, float_type) == 1) return .{ .float = py.PyFloat_AsDouble(obj) };
+
+    if (py.PyDict_Check(obj) != 0) {
+        const entries = arena.alloc(yaml.Entry, @intCast(py.PyDict_Size(obj))) catch return noMemory();
+        var pos: py.Py_ssize_t = 0;
+        var key: [*c]py.PyObject = null;
+        var val: [*c]py.PyObject = null;
+        var i: usize = 0;
+        while (py.PyDict_Next(obj, &pos, &key, &val) != 0) : (i += 1) {
+            if (py.PyDict_Check(key) != 0 or py.PyList_Check(key) != 0 or py.PyTuple_Check(key) != 0) {
+                return typeError("mapping keys must be str, int, float, bool or None, not", key);
+            }
+            entries[i] = .{ .key = try toValue(arena, key, depth + 1), .value = try toValue(arena, val, depth + 1) };
+        }
+        return .{ .map = entries };
+    }
+    if (py.PyList_Check(obj) != 0 or py.PyTuple_Check(obj) != 0) {
+        const is_list = py.PyList_Check(obj) != 0;
+        const len: usize = @intCast(if (is_list) py.PyList_Size(obj) else py.PyTuple_Size(obj));
+        const items = arena.alloc(yaml.Value, len) catch return noMemory();
+        for (items, 0..) |*item, i| {
+            const elem = if (is_list) py.PyList_GetItem(obj, @intCast(i)) else py.PyTuple_GetItem(obj, @intCast(i));
+            item.* = try toValue(arena, elem orelse return error.PythonError, depth + 1);
+        }
+        return .{ .seq = items };
+    }
+    return typeError("cannot dump objects of type", obj);
+}
+
+fn utf8(obj: *py.PyObject) PyError![]const u8 {
+    var len: py.Py_ssize_t = 0;
+    const ptr = py.PyUnicode_AsUTF8AndSize(obj, &len) orelse return error.PythonError;
+    return ptr[0..@intCast(len)];
+}
+
+fn toInt(obj: *py.PyObject) PyError!i128 {
+    var overflow: c_int = 0;
+    const small = py.PyLong_AsLongLongAndOverflow(obj, &overflow);
+    if (overflow == 0) {
+        if (small == -1 and py.PyErr_Occurred() != null) return error.PythonError;
+        return small;
+    }
+    // Wider than 64 bits: go through the decimal digits.
+    const digits = try check(py.PyNumber_ToBase(obj, 10));
+    defer py.Py_DecRef(digits);
+    return std.fmt.parseInt(i128, try utf8(digits), 10) catch {
+        py.PyErr_SetString(value_error, "integers wider than 128 bits cannot be dumped");
+        return error.PythonError;
+    };
+}
+
+fn writeTo(stream: *py.PyObject, text: *py.PyObject) PyError!void {
+    const write = py.PyObject_GetAttrString(stream, "write") orelse return error.PythonError;
+    defer py.Py_DecRef(write);
+    const call_args = try check(py.PyTuple_Pack(1, text));
+    defer py.Py_DecRef(call_args);
+    const result = try check(py.PyObject_CallObject(write, call_args));
+    py.Py_DecRef(result);
+}
+
+fn raiseDumpError(err: yaml.EmitError) PyError {
+    switch (err) {
+        error.OutOfMemory, error.WriteFailed => return noMemory(),
+        error.NestingTooDeep => py.PyErr_SetString(value_error, "data is nested more than 128 levels deep"),
+        error.InvalidUtf8 => py.PyErr_SetString(value_error, "string is not valid UTF-8"),
+        error.UnrepresentableInt => py.PyErr_SetString(value_error, "integers wider than 128 bits cannot be dumped"),
+        error.UnrepresentableScalar => py.PyErr_SetString(value_error, "value cannot be represented in YAML"),
+    }
+    return error.PythonError;
+}
+
+fn typeError(comptime prefix: [:0]const u8, obj: *py.PyObject) PyError {
+    const type_obj = py.PyObject_Type(obj) orelse return error.PythonError;
+    defer py.Py_DecRef(type_obj);
+    const name = py.PyObject_GetAttrString(type_obj, "__name__") orelse return error.PythonError;
+    defer py.Py_DecRef(name);
+    const text = utf8(name) catch return error.PythonError;
+    var buf: [256]u8 = undefined;
+    const msg = std.mem.printSentinel(&buf, prefix ++ " {s}", .{text}, 0) catch prefix;
+    py.PyErr_SetString(type_error, msg.ptr);
+    return error.PythonError;
+}
+
+fn noMemory() PyError {
+    _ = py.PyErr_NoMemory();
+    return error.PythonError;
+}
+
+// ---------------------------------------------------------------------------
 // Small Python helpers
 
 fn check(obj: ?*py.PyObject) PyError!*py.PyObject {
@@ -244,6 +413,9 @@ fn moduleExec(module: [*c]py.PyObject) callconv(.c) c_int {
     if (none_obj == null) none_obj = py.Py_BuildValue("") orelse return -1;
     if (value_error == null) value_error = builtin("ValueError") orelse return -1;
     if (type_error == null) type_error = builtin("TypeError") orelse return -1;
+    if (true_obj == null) true_obj = py.PyBool_FromLong(1) orelse return -1;
+    if (false_obj == null) false_obj = py.PyBool_FromLong(0) orelse return -1;
+    if (float_type == null) float_type = builtin("float") orelse return -1;
     if (yaml_error == null) {
         yaml_error = py.PyErr_NewException("zaml.YAMLError", value_error, null);
         if (yaml_error == null) return -1;
@@ -271,6 +443,20 @@ var methods = [_]py.PyMethodDef{
         .ml_doc = "load_all(stream, /, *, schema='core')\n--\n\n" ++
             "Parse every YAML document in a str, bytes or file object into a list.",
     },
+    .{
+        .ml_name = "dump",
+        .ml_meth = @ptrCast(&dump),
+        .ml_flags = py.METH_VARARGS | py.METH_KEYWORDS,
+        .ml_doc = "dump(data, /, stream=None, *, indent=2, sort_keys=False)\n--\n\n" ++
+            "Serialize data as a YAML document. Return it as a str, or write it to stream.",
+    },
+    .{
+        .ml_name = "dump_all",
+        .ml_meth = @ptrCast(&dumpAll),
+        .ml_flags = py.METH_VARARGS | py.METH_KEYWORDS,
+        .ml_doc = "dump_all(documents, /, stream=None, *, indent=2, sort_keys=False)\n--\n\n" ++
+            "Serialize an iterable of documents as a YAML stream separated by ---.",
+    },
     std.mem.zeroes(py.PyMethodDef),
 };
 
@@ -282,7 +468,7 @@ var slots = [_]py.PyModuleDef_Slot{
 var module_def: py.PyModuleDef = .{
     .m_base = std.mem.zeroes(py.PyModuleDef_Base),
     .m_name = "zaml",
-    .m_doc = "Fast YAML 1.2 parsing for Python, written in Zig.",
+    .m_doc = "Fast YAML 1.2 parsing and dumping for Python, written in Zig.",
     .m_size = 0,
     .m_methods = &methods,
     .m_slots = &slots,

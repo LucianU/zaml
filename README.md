@@ -1,8 +1,8 @@
 # 🚀 zaml
 
-**Fast YAML parsing for Python, written in Zig.** zaml reads YAML about 11×
-faster than PyYAML's C loader and returns plain Python dicts, lists, strings
-and numbers.
+**Fast YAML for Python, written in Zig.** zaml reads YAML about 11× faster
+than PyYAML's C loader, and writes it about 24× faster, using plain Python
+dicts, lists, strings and numbers.
 
 ```python
 import zaml
@@ -14,10 +14,17 @@ server:
 debug: false
 """)
 # {'server': {'host': 'localhost', 'ports': [8080, 8443]}, 'debug': False}
+
+print(zaml.dump(config))
+# server:
+#   host: localhost
+#   ports:
+#     - 8080
+#     - 8443
+# debug: false
 ```
 
-zaml is experimental. It only **reads** YAML; to write YAML, keep using
-PyYAML or ruamel.yaml.
+zaml is experimental: see [Differences from PyYAML](#differences-from-pyyaml).
 
 ## Quick start
 
@@ -52,8 +59,9 @@ with open("config.yaml", encoding="utf-8") as f:
 | --- | --- |
 | `yaml.safe_load(stream)` | `zaml.load(stream)` |
 | `yaml.safe_load_all(stream)` | `zaml.load_all(stream)` (returns a list, not a generator) |
+| `yaml.safe_dump(data, stream)` | `zaml.dump(data, stream)` |
+| `yaml.safe_dump_all(documents, stream)` | `zaml.dump_all(documents, stream)` |
 | `except yaml.YAMLError` | `except zaml.YAMLError` |
-| `yaml.dump(...)` | Not available: zaml only reads YAML |
 
 One difference matters for most files: zaml follows YAML 1.2, while PyYAML
 follows YAML 1.1. Under YAML 1.2, `yes`, `no`, `on` and `off` are strings,
@@ -128,16 +136,38 @@ zaml.load("a: 1\na: 2\n")
 # zaml.YAMLError: duplicate mapping key: 'a'
 ```
 
+### Writing YAML
+
+```python
+zaml.dump(data, stream=None, *, indent=2, sort_keys=False)
+zaml.dump_all(documents, stream=None, *, indent=2, sort_keys=False)
+```
+
+`dump` returns the YAML as a `str`, or writes it to `stream` (anything with a
+`write()` method, such as a file opened in text mode) and returns `None`.
+`dump_all` writes several documents separated by `---`.
+
+```python
+with open("config.yaml", "w", encoding="utf-8") as f:
+    zaml.dump(config, f)
+```
+
+zaml writes `dict`, `list`, `tuple`, `str`, `int`, `float`, `bool` and `None`;
+any other type raises `TypeError`. Keys stay in the dict's order unless you
+pass `sort_keys=True`. Strings that would read back as something else are
+quoted, so `"yes"`, `"123"` and `"null"` stay strings, also for PyYAML.
+
 ## Performance
 
-Parsing a 1,000,000-key mapping (16.8 MB) on an Apple Silicon Mac, Python 3.13:
+Reading and writing a 1,000,000-key mapping (16.8 MB of YAML) on an Apple
+Silicon Mac, Python 3.13:
 
-| Library | Time |
-| --- | --- |
-| **zaml** | **0.47 s** |
-| PyYAML (C loader) | 5.45 s |
-| PyYAML (pure Python) | 31.61 s |
-| ruamel.yaml (safe) | 45.20 s |
+| Library | Read | Write |
+| --- | --- | --- |
+| **zaml** | **0.44 s** | **0.17 s** |
+| PyYAML (C) | 5.35 s | 4.10 s |
+| PyYAML (pure Python) | 31.20 s | 18.11 s |
+| ruamel.yaml (safe) | 44.22 s | 31.36 s |
 
 zaml also lets other Python threads run while it parses. To run the benchmark
 yourself, see [Development](#development).
@@ -158,6 +188,15 @@ Compared with PyYAML's `safe_load`:
 - Integers wider than 128 bits become floats.
 - `!!float 2` raises because of a bug in the parser; `!!float 2.0` works.
 
+When writing:
+
+- Output is always in block style; there is no compact `{a: 1}` form.
+- Dates, `bytes` and `set` raise `TypeError`; convert them first, for example
+  with `date.isoformat()`.
+- An object that appears twice is written out twice, not as an anchor and
+  alias.
+- Data that contains itself raises `ValueError`.
+
 zaml also rejects documents nested more than 128 levels deep, and aliases that
 expand to more than 1,000,000 values, which protects against
 ["billion laughs"](https://en.wikipedia.org/wiki/Billion_laughs_attack) inputs.
@@ -168,7 +207,7 @@ A few invalid documents are still accepted; the parser lists them in its
 
 zaml is a CPython extension written in Zig. It parses with
 [yaml-zig](https://github.com/sakakibara/yaml-zig), then converts the result
-into Python objects. It imports `Python.h` directly, with no `ctypes` or
+into Python objects; writing goes the other way, through yaml-zig's emitter. It imports `Python.h` directly, with no `ctypes` or
 `cffi`, and builds against the CPython stable ABI, so one build works on every
 Python from 3.10 on. The Zig compiler comes from the
 [`ziglang`](https://pypi.org/project/ziglang/) package on PyPI.
