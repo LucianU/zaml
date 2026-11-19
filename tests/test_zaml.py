@@ -415,3 +415,102 @@ def test_dump_huge_int():
 def test_dump_unencodable_string():
     with pytest.raises(UnicodeEncodeError):
         zaml.dump("\ud800")
+
+
+# ---------------------------------------------------------------------------
+# dump(default=...)
+
+import decimal
+import enum
+import pathlib
+
+
+def test_default_converts_unsupported_values():
+    data = {
+        "when": datetime.date(2026, 11, 19),
+        "price": decimal.Decimal("9.99"),
+        "path": pathlib.PurePosixPath("/etc/zaml.yaml"),
+    }
+    assert zaml.load(zaml.dump(data, default=str)) == {"when": "2026-11-19", "price": "9.99", "path": "/etc/zaml.yaml"}
+
+
+def test_default_can_return_collections():
+    class Color(enum.Enum):
+        RED = 1
+
+    def default(obj):
+        if isinstance(obj, set):
+            return sorted(obj)
+        if isinstance(obj, Color):
+            return {"color": obj.name}
+        raise TypeError(f"unexpected {obj!r}")
+
+    data = {"tags": {"b", "a"}, "c": Color.RED}
+    assert zaml.load(zaml.dump(data, default=default)) == {"tags": ["a", "b"], "c": {"color": "RED"}}
+
+
+def test_default_applies_to_keys():
+    data = {datetime.date(2026, 11, 19): "release"}
+    assert zaml.load(zaml.dump(data, default=lambda d: d.isoformat())) == {"2026-11-19": "release"}
+
+
+def test_default_key_must_not_become_a_collection():
+    with pytest.raises(TypeError, match="mapping keys"):
+        zaml.dump({datetime.date(2026, 1, 1): 1}, default=lambda d: [d.year])
+
+
+def test_default_is_not_called_for_supported_types():
+    calls = []
+    zaml.dump({"a": [1, 2.5, "s", None, True, (1,)]}, default=calls.append)
+    assert calls == []
+
+
+def test_default_used_by_dump_all():
+    assert zaml.load_all(zaml.dump_all([{1, 2}, {3}], default=sorted)) == [[1, 2], [3]]
+
+
+def test_default_errors_propagate():
+    def default(obj):
+        raise KeyError("boom")
+
+    with pytest.raises(KeyError, match="boom"):
+        zaml.dump({"a": object()}, default=default)
+
+
+def test_default_that_never_settles():
+    with pytest.raises(ValueError, match="nested"):
+        zaml.dump(object(), default=lambda o: o)
+
+
+def test_default_must_be_callable():
+    with pytest.raises(TypeError, match="callable"):
+        zaml.dump({}, default=42)  # pyright: ignore[reportArgumentType]
+
+
+class _Mutator:
+    """An unsupported value whose `default` empties the container being dumped."""
+
+
+def test_default_clearing_the_dict_being_dumped():
+    data = {"a": _Mutator(), "b": "x" * 100, "c": "y" * 100}
+    with pytest.raises(RuntimeError, match="changed size"):
+        zaml.dump(data, default=lambda o: data.clear())
+
+
+def test_default_clearing_the_list_being_dumped():
+    data = [_Mutator(), "x" * 100, "y" * 100]
+    with pytest.raises(IndexError):
+        zaml.dump(data, default=lambda o: data.clear())
+
+
+def test_default_freeing_strings_already_converted():
+    # The strings dumped before `default` runs are freed by it; the output must
+    # still contain them intact.
+    data = {"first": "z" * 1000, "obj": _Mutator()}
+
+    def default(obj):
+        data["first"] = None
+        return "replaced"
+
+    text = zaml.dump(data, default=default)
+    assert zaml.load(text) == {"first": "z" * 1000, "obj": "replaced"}

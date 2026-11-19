@@ -22,6 +22,7 @@ var yaml_error: ?*py.PyObject = null;
 var none_obj: ?*py.PyObject = null;
 var value_error: ?*py.PyObject = null;
 var type_error: ?*py.PyObject = null;
+var runtime_error: ?*py.PyObject = null;
 var true_obj: ?*py.PyObject = null;
 var false_obj: ?*py.PyObject = null;
 var float_type: ?*py.PyObject = null;
@@ -232,29 +233,34 @@ fn dumpDocuments(args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!
     var stream: ?*py.PyObject = null;
     var indent: py.Py_ssize_t = 2;
     var sort_keys: c_int = 0;
-    var keywords = [_:null]?[*:0]const u8{ "", "stream", "indent", "sort_keys" };
-    if (py.PyArg_ParseTupleAndKeywords(args, kwargs, "O|O$np", @ptrCast(&keywords), &data, &stream, &indent, &sort_keys) == 0) {
+    var default: ?*py.PyObject = null;
+    var keywords = [_:null]?[*:0]const u8{ "", "stream", "indent", "sort_keys", "default" };
+    if (py.PyArg_ParseTupleAndKeywords(args, kwargs, "O|O$npO", @ptrCast(&keywords), &data, &stream, &indent, &sort_keys, &default) == 0) {
         return error.PythonError;
     }
+    if (default == none_obj) default = null;
+    if (default) |d| if (py.PyCallable_Check(d) == 0) {
+        py.PyErr_SetString(type_error, "default must be callable");
+        return error.PythonError;
+    };
     if (indent < 1 or indent > 16) {
         py.PyErr_SetString(value_error, "indent must be between 1 and 16");
         return error.PythonError;
     }
     if (stream == none_obj) stream = null;
 
-    // The GIL stays held throughout: the value tree borrows string data from
-    // the Python objects, which must not change or be freed until emitted.
+    // The GIL stays held until the text is emitted (see Dumper).
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const dumper: Dumper = .{ .arena = arena_state.allocator(), .default = default };
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     const options: yaml.EmitOptions = .{ .indent = @intCast(indent), .sort_keys = sort_keys != 0 };
 
     const result = switch (mode) {
-        .first => yaml.emit(&out.writer, try toValue(arena, data.?, 0), options),
-        .all => yaml.emitStream(&out.writer, try toValues(arena, data.?), options),
+        .first => yaml.emit(&out.writer, try dumper.value(data.?, 0), options),
+        .all => yaml.emitStream(&out.writer, try dumper.values(data.?), options),
     };
     result catch |err| return raiseDumpError(err);
 
@@ -267,60 +273,116 @@ fn dumpDocuments(args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!
     return text;
 }
 
-fn toValues(arena: std.mem.Allocator, documents: *py.PyObject) PyError![]yaml.Value {
-    const iter = py.PyObject_GetIter(documents) orelse return error.PythonError;
-    defer py.Py_DecRef(iter);
-    var values: std.ArrayList(yaml.Value) = .empty;
-    while (py.PyIter_Next(iter)) |doc| {
-        defer py.Py_DecRef(doc);
-        values.append(arena, try toValue(arena, doc, 0)) catch return noMemory();
-    }
-    if (py.PyErr_Occurred() != null) return error.PythonError;
-    return values.items;
-}
-
 /// Matches the emitter's own limit; also stops data that contains itself.
 const max_dump_depth = 128;
 
-/// Converts a Python object to a yaml.Value. Calls no Python code, so the
-/// borrowed string data stays valid while the GIL is held.
-fn toValue(arena: std.mem.Allocator, obj: *py.PyObject, depth: usize) PyError!yaml.Value {
-    if (depth > max_dump_depth) {
-        py.PyErr_SetString(value_error, "data is nested more than 128 levels deep, or contains itself");
-        return error.PythonError;
-    }
-    if (obj == none_obj) return .null;
-    if (obj == true_obj) return .{ .bool = true };
-    if (obj == false_obj) return .{ .bool = false };
-    if (py.PyUnicode_Check(obj) != 0) return .{ .string = try utf8(obj) };
-    if (py.PyLong_Check(obj) != 0) return .{ .int = try toInt(obj) };
-    if (py.PyObject_IsInstance(obj, float_type) == 1) return .{ .float = py.PyFloat_AsDouble(obj) };
+/// Converts Python objects to yaml.Values for the emitter.
+///
+/// Without `default`, no Python code runs during conversion, so the value tree
+/// can borrow string data from the Python objects (the GIL stays held until
+/// the text is emitted). `default` is arbitrary Python code that could change
+/// or free the objects being converted, so with it, strings are copied into
+/// the arena and every container being walked is kept alive.
+const Dumper = struct {
+    arena: std.mem.Allocator,
+    default: ?*py.PyObject,
 
-    if (py.PyDict_Check(obj) != 0) {
-        const entries = arena.alloc(yaml.Entry, @intCast(py.PyDict_Size(obj))) catch return noMemory();
+    fn values(self: Dumper, documents: *py.PyObject) PyError![]yaml.Value {
+        const iter = py.PyObject_GetIter(documents) orelse return error.PythonError;
+        defer py.Py_DecRef(iter);
+        var list: std.ArrayList(yaml.Value) = .empty;
+        while (py.PyIter_Next(iter)) |doc| {
+            defer py.Py_DecRef(doc);
+            list.append(self.arena, try self.value(doc, 0)) catch return noMemory();
+        }
+        if (py.PyErr_Occurred() != null) return error.PythonError;
+        return list.items;
+    }
+
+    fn value(self: Dumper, obj: *py.PyObject, depth: usize) PyError!yaml.Value {
+        if (depth > max_dump_depth) {
+            py.PyErr_SetString(value_error, "data is nested more than 128 levels deep, or contains itself");
+            return error.PythonError;
+        }
+        if (obj == none_obj) return .null;
+        if (obj == true_obj) return .{ .bool = true };
+        if (obj == false_obj) return .{ .bool = false };
+        if (py.PyUnicode_Check(obj) != 0) return .{ .string = try self.string(obj) };
+        if (py.PyLong_Check(obj) != 0) return .{ .int = try toInt(obj) };
+        if (py.PyObject_IsInstance(obj, float_type) == 1) return .{ .float = py.PyFloat_AsDouble(obj) };
+        if (py.PyDict_Check(obj) != 0) return self.map(obj, depth);
+        if (py.PyList_Check(obj) != 0 or py.PyTuple_Check(obj) != 0) return self.seq(obj, depth);
+
+        const default = self.default orelse return typeError("cannot dump objects of type", obj);
+        const call_args = try check(py.PyTuple_Pack(1, obj));
+        defer py.Py_DecRef(call_args);
+        const replacement = try check(py.PyObject_CallObject(default, call_args));
+        defer py.Py_DecRef(replacement);
+        // A default that returns another unsupported object is called again
+        // on it; the depth limit stops one that never settles.
+        return self.value(replacement, depth + 1);
+    }
+
+    fn map(self: Dumper, obj: *py.PyObject, depth: usize) PyError!yaml.Value {
+        self.hold(obj);
+        defer self.release(obj);
+        const entries = self.arena.alloc(yaml.Entry, @intCast(py.PyDict_Size(obj))) catch return noMemory();
         var pos: py.Py_ssize_t = 0;
         var key: [*c]py.PyObject = null;
         var val: [*c]py.PyObject = null;
         var i: usize = 0;
         while (py.PyDict_Next(obj, &pos, &key, &val) != 0) : (i += 1) {
-            if (py.PyDict_Check(key) != 0 or py.PyList_Check(key) != 0 or py.PyTuple_Check(key) != 0) {
-                return typeError("mapping keys must be str, int, float, bool or None, not", key);
+            if (i == entries.len) return changedDuringDump();
+            self.hold(key);
+            defer self.release(key);
+            self.hold(val);
+            defer self.release(val);
+            const k = try self.value(key, depth + 1);
+            switch (k) {
+                .seq, .map => return typeError("mapping keys must be str, int, float, bool or None, not", key),
+                else => {},
             }
-            entries[i] = .{ .key = try toValue(arena, key, depth + 1), .value = try toValue(arena, val, depth + 1) };
+            entries[i] = .{ .key = k, .value = try self.value(val, depth + 1) };
         }
+        if (i != entries.len) return changedDuringDump();
         return .{ .map = entries };
     }
-    if (py.PyList_Check(obj) != 0 or py.PyTuple_Check(obj) != 0) {
+
+    fn seq(self: Dumper, obj: *py.PyObject, depth: usize) PyError!yaml.Value {
+        self.hold(obj);
+        defer self.release(obj);
         const is_list = py.PyList_Check(obj) != 0;
         const len: usize = @intCast(if (is_list) py.PyList_Size(obj) else py.PyTuple_Size(obj));
-        const items = arena.alloc(yaml.Value, len) catch return noMemory();
+        const items = self.arena.alloc(yaml.Value, len) catch return noMemory();
         for (items, 0..) |*item, i| {
-            const elem = if (is_list) py.PyList_GetItem(obj, @intCast(i)) else py.PyTuple_GetItem(obj, @intCast(i));
-            item.* = try toValue(arena, elem orelse return error.PythonError, depth + 1);
+            // A list that shrinks under `default` makes GetItem raise IndexError.
+            const elem = (if (is_list) py.PyList_GetItem(obj, @intCast(i)) else py.PyTuple_GetItem(obj, @intCast(i))) orelse return error.PythonError;
+            self.hold(elem);
+            defer self.release(elem);
+            item.* = try self.value(elem, depth + 1);
         }
         return .{ .seq = items };
     }
-    return typeError("cannot dump objects of type", obj);
+
+    fn string(self: Dumper, obj: *py.PyObject) PyError![]const u8 {
+        const text = try utf8(obj);
+        if (self.default == null) return text;
+        return self.arena.dupe(u8, text) catch noMemory();
+    }
+
+    /// Keeps a borrowed object alive while `default` may run.
+    fn hold(self: Dumper, obj: *py.PyObject) void {
+        if (self.default != null) py.Py_IncRef(obj);
+    }
+
+    fn release(self: Dumper, obj: *py.PyObject) void {
+        if (self.default != null) py.Py_DecRef(obj);
+    }
+};
+
+fn changedDuringDump() PyError {
+    py.PyErr_SetString(runtime_error, "dictionary changed size during dump");
+    return error.PythonError;
 }
 
 fn utf8(obj: *py.PyObject) PyError![]const u8 {
@@ -413,6 +475,7 @@ fn moduleExec(module: [*c]py.PyObject) callconv(.c) c_int {
     if (none_obj == null) none_obj = py.Py_BuildValue("") orelse return -1;
     if (value_error == null) value_error = builtin("ValueError") orelse return -1;
     if (type_error == null) type_error = builtin("TypeError") orelse return -1;
+    if (runtime_error == null) runtime_error = builtin("RuntimeError") orelse return -1;
     if (true_obj == null) true_obj = py.PyBool_FromLong(1) orelse return -1;
     if (false_obj == null) false_obj = py.PyBool_FromLong(0) orelse return -1;
     if (float_type == null) float_type = builtin("float") orelse return -1;
@@ -447,14 +510,15 @@ var methods = [_]py.PyMethodDef{
         .ml_name = "dump",
         .ml_meth = @ptrCast(&dump),
         .ml_flags = py.METH_VARARGS | py.METH_KEYWORDS,
-        .ml_doc = "dump(data, /, stream=None, *, indent=2, sort_keys=False)\n--\n\n" ++
-            "Serialize data as a YAML document. Return it as a str, or write it to stream.",
+        .ml_doc = "dump(data, /, stream=None, *, indent=2, sort_keys=False, default=None)\n--\n\n" ++
+            "Serialize data as a YAML document. Return it as a str, or write it to stream.\n" ++
+            "default(obj) is called for objects of unsupported types and returns a replacement.",
     },
     .{
         .ml_name = "dump_all",
         .ml_meth = @ptrCast(&dumpAll),
         .ml_flags = py.METH_VARARGS | py.METH_KEYWORDS,
-        .ml_doc = "dump_all(documents, /, stream=None, *, indent=2, sort_keys=False)\n--\n\n" ++
+        .ml_doc = "dump_all(documents, /, stream=None, *, indent=2, sort_keys=False, default=None)\n--\n\n" ++
             "Serialize an iterable of documents as a YAML stream separated by ---.",
     },
     std.mem.zeroes(py.PyMethodDef),

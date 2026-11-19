@@ -139,8 +139,8 @@ zaml.load("a: 1\na: 2\n")
 ### Writing YAML
 
 ```python
-zaml.dump(data, stream=None, *, indent=2, sort_keys=False)
-zaml.dump_all(documents, stream=None, *, indent=2, sort_keys=False)
+zaml.dump(data, stream=None, *, indent=2, sort_keys=False, default=None)
+zaml.dump_all(documents, stream=None, *, indent=2, sort_keys=False, default=None)
 ```
 
 `dump` returns the YAML as a `str`, or writes it to `stream` (anything with a
@@ -152,10 +152,32 @@ with open("config.yaml", "w", encoding="utf-8") as f:
     zaml.dump(config, f)
 ```
 
-zaml writes `dict`, `list`, `tuple`, `str`, `int`, `float`, `bool` and `None`;
-any other type raises `TypeError`. Keys stay in the dict's order unless you
-pass `sort_keys=True`. Strings that would read back as something else are
-quoted, so `"yes"`, `"123"` and `"null"` stay strings, also for PyYAML.
+zaml writes `dict`, `list`, `tuple`, `str`, `int`, `float`, `bool` and `None`.
+Keys stay in the dict's order unless you pass `sort_keys=True`. Strings that
+would read back as something else are quoted, so `"yes"`, `"123"` and `"null"`
+stay strings, also for PyYAML.
+
+For any other type, such as dates, `Decimal`, `Path`, enums or sets, pass
+`default`: a function that zaml calls with the object, and whose return value
+it writes instead. This works like `default` in `json.dumps`. Without it,
+those types raise `TypeError`.
+
+```python
+import datetime
+
+zaml.dump({"released": datetime.date(2026, 11, 19)}, default=str)
+# 'released: "2026-11-19"\n'
+
+def default(obj):
+    if isinstance(obj, set):
+        return sorted(obj)
+    if isinstance(obj, datetime.date):
+        return obj.isoformat()
+    raise TypeError(f"cannot dump {obj!r}")
+
+zaml.dump({"tags": {"zig", "yaml"}}, default=default)
+# 'tags:\n  - yaml\n  - zig\n'
+```
 
 ## Performance
 
@@ -191,8 +213,9 @@ Compared with PyYAML's `safe_load`:
 When writing:
 
 - Output is always in block style; there is no compact `{a: 1}` form.
-- Dates, `bytes` and `set` raise `TypeError`; convert them first, for example
-  with `date.isoformat()`.
+- Dates, `bytes` and `set` are not written natively (PyYAML writes them as
+  YAML 1.1 timestamps, `!!binary` and `!!set`). Use `default` to convert them;
+  dates then read back as strings.
 - An object that appears twice is written out twice, not as an anchor and
   alias.
 - Data that contains itself raises `ValueError`.
