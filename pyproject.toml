@@ -31,6 +31,16 @@ skip = "*-musllinux_*"
 test-groups = ["dev"]
 test-command = "pytest {project}/tests"
 
+[tool.cibuildwheel.macos]
+# Built on an Intel runner: zig cross-compiles the Apple Silicon wheel, whose
+# tests cannot run there (it is tested on Apple Silicon machines instead).
+archs = ["x86_64", "arm64"]
+test-skip = "*-macosx_arm64"
+
+[tool.cibuildwheel.windows]
+# 64-bit only; 32-bit Windows Python is rare and untested here.
+archs = ["AMD64"]
+
 [tool.pyright]
 venvPath = "."
 venv = ".venv"

@@ -39,7 +39,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
+        # macos-15-intel builds both Mac wheels (see pyproject.toml); GitHub's
+        # Apple Silicon runners are too often unavailable.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15-intel, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: pypa/cibuildwheel@v3.2.1
