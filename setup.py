@@ -85,7 +85,12 @@ class ZigBuildExt(build_ext):
 
 
 setup(
-    ext_modules=[Extension("zaml", sources=["src/zaml.zig"], py_limited_api=True)],
+    # The compiled module is zaml._zaml; the zaml package re-exports it and
+    # ships its type stub (__init__.pyi, py.typed).
+    packages=["zaml"],
+    package_dir={"": "src"},
+    package_data={"zaml": ["__init__.pyi", "py.typed"]},
+    ext_modules=[Extension("zaml._zaml", sources=["src/zaml.zig"], py_limited_api=True)],
     cmdclass={"build_ext": ZigBuildExt},
     options={"bdist_wheel": {"py_limited_api": LIMITED_API}},
 )

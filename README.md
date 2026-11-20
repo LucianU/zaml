@@ -290,7 +290,8 @@ Set `ZIG=/path/to/zig` to build with a different Zig binary.
 
 | Path | Contents |
 | --- | --- |
-| `src/zaml.zig` | The extension module: parse with yaml-zig, then convert its values to Python objects |
+| `src/zaml.zig` | The extension module (`zaml._zaml`): parse with yaml-zig, then convert its values to Python objects |
+| `src/zaml/` | The `zaml` package: re-exports the extension and ships its type stub |
 | `src/python.h` | `Python.h` with the stable-ABI settings, translated to Zig by `build.zig` |
 | `build.zig`, `build.zig.zon` | Build the shared library; `build.zig.zon` pins the yaml-zig commit |
 | `setup.py` | setuptools `build_ext` that calls `zig build` |

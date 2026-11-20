@@ -593,7 +593,7 @@ var slots = [_]py.PyModuleDef_Slot{
 
 var module_def: py.PyModuleDef = .{
     .m_base = std.mem.zeroes(py.PyModuleDef_Base),
-    .m_name = "zaml",
+    .m_name = "zaml._zaml",
     .m_doc = "Fast YAML 1.2 parsing and dumping for Python, written in Zig.",
     .m_size = 0,
     .m_methods = &methods,
@@ -603,7 +603,7 @@ var module_def: py.PyModuleDef = .{
     .m_free = null,
 };
 
-pub export fn PyInit_zaml() callconv(.c) ?*py.PyObject {
+pub export fn PyInit__zaml() callconv(.c) ?*py.PyObject {
     // Equivalent of PyModuleDef_HEAD_INIT: the definition starts with one reference.
     const def_obj: *py.PyObject = @ptrCast(&module_def);
     if (module_def.m_base.m_index == 0) py.Py_IncRef(def_obj);
