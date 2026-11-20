@@ -258,7 +258,8 @@ zaml is a CPython extension written in Zig. It parses with
 [yaml-zig](https://github.com/sakakibara/yaml-zig), then converts the result
 into Python objects; writing goes the other way, through yaml-zig's emitter. It imports `Python.h` directly, with no `ctypes` or
 `cffi`, and builds against the CPython stable ABI, so one build works on every
-Python from 3.10 on. The Zig compiler comes from the
+Python from 3.10 on. It keeps its state per module, so it also works in
+subinterpreters, including ones with their own GIL (Python 3.12+). The Zig compiler comes from the
 [`ziglang`](https://pypi.org/project/ziglang/) package on PyPI.
 
 ## Development

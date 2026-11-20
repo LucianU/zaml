@@ -12,44 +12,61 @@ const gpa = std.heap.c_allocator;
 /// Raised by a helper when a Python exception has already been set.
 const PyError = error{PythonError};
 
-/// `zaml.YAMLError`, a subclass of `ValueError`.
-var yaml_error: ?*py.PyObject = null;
+/// Per-module state. Every interpreter that imports zaml gets its own module
+/// object with its own copy, so no Python object is shared between
+/// interpreters (PEP 630, PEP 684); zaml keeps no Python objects in globals.
+///
+/// It also holds the built-in objects zaml needs. Python exports None and the
+/// built-in exceptions as data, and on Windows data from a DLL must be read
+/// through its `__imp_` pointer, which translate-c does not emit; so instead
+/// of referencing `_Py_NoneStruct` or `PyExc_*`, zaml looks them up at import.
+const State = extern struct {
+    /// `zaml.YAMLError`, a subclass of `ValueError`.
+    yaml_error: ?*py.PyObject,
+    none_obj: ?*py.PyObject,
+    true_obj: ?*py.PyObject,
+    false_obj: ?*py.PyObject,
+    value_error: ?*py.PyObject,
+    type_error: ?*py.PyObject,
+    runtime_error: ?*py.PyObject,
+    float_type: ?*py.PyObject,
 
-// Python exports None and the built-in exceptions as data. On Windows, data
-// from a DLL must be read through its `__imp_` pointer, which translate-c does
-// not emit, so referencing `_Py_NoneStruct` or `PyExc_*` directly reads garbage.
-// Look these objects up through function calls at module load instead.
-var none_obj: ?*py.PyObject = null;
-var value_error: ?*py.PyObject = null;
-var type_error: ?*py.PyObject = null;
-var runtime_error: ?*py.PyObject = null;
-var true_obj: ?*py.PyObject = null;
-var false_obj: ?*py.PyObject = null;
-var float_type: ?*py.PyObject = null;
+    const fields = @typeInfo(State).@"struct".field_names;
+
+    fn of(module: *py.PyObject) *State {
+        return @ptrCast(@alignCast(py.PyModule_GetState(module).?));
+    }
+
+    /// A new reference to None.
+    fn none(st: *const State) *py.PyObject {
+        py.Py_IncRef(st.none_obj);
+        return st.none_obj.?;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Python entry points
 
-fn load(_: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
-    return loadDocuments(args, kwargs, .first) catch null;
+fn load(module: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
+    return loadDocuments(State.of(module), args, kwargs, .first) catch null;
 }
 
-fn loadAll(_: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
-    return loadDocuments(args, kwargs, .all) catch null;
+fn loadAll(module: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
+    return loadDocuments(State.of(module), args, kwargs, .all) catch null;
 }
 
 const Mode = enum { first, all };
 
-fn loadDocuments(args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!*py.PyObject {
+fn loadDocuments(st: *const State, args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!*py.PyObject {
     var stream: ?*py.PyObject = null;
     var schema_name: [*c]const u8 = "core";
     var keywords = [_:null]?[*:0]const u8{ "", "schema" };
     if (py.PyArg_ParseTupleAndKeywords(args, kwargs, "O|$s", @ptrCast(&keywords), &stream, &schema_name) == 0) {
         return error.PythonError;
     }
-    const schema = try parseSchema(std.mem.span(schema_name));
+    const schema = try parseSchema(st, std.mem.span(schema_name));
 
-    const source = try Source.get(stream.?);
+    const source = try Source.get(st, stream.?);
     defer source.release();
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -62,13 +79,13 @@ fn loadDocuments(args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!
     const result = yaml.parseStream(arena, source.bytes, .{ .errors = &diagnostics, .schema = schema });
     py.PyEval_RestoreThread(thread_state);
 
-    const docs = result catch |err| return raiseLoadError(err, diagnostics.items, source.bytes);
+    const docs = result catch |err| return raiseLoadError(st, err, diagnostics.items, source.bytes);
 
-    var loader: Loader = .{};
+    var loader: Loader = .{ .st = st };
     defer loader.deinit();
     switch (mode) {
         .first => {
-            if (docs.len == 0) return none();
+            if (docs.len == 0) return st.none();
             return loader.convert(docs[0]);
         },
         .all => {
@@ -83,11 +100,11 @@ fn loadDocuments(args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!
     }
 }
 
-fn parseSchema(name: []const u8) PyError!yaml.Schema {
+fn parseSchema(st: *const State, name: []const u8) PyError!yaml.Schema {
     inline for (.{ "core", "yaml11", "json", "failsafe" }) |option| {
         if (std.mem.eql(u8, name, option)) return @field(yaml.Schema, option);
     }
-    py.PyErr_SetString(value_error, "schema must be 'core', 'yaml11', 'json' or 'failsafe'");
+    py.PyErr_SetString(st.value_error, "schema must be 'core', 'yaml11', 'json' or 'failsafe'");
     return error.PythonError;
 }
 
@@ -98,19 +115,19 @@ const Source = struct {
     /// A new reference that keeps `bytes` alive, when we created one.
     owner: ?*py.PyObject = null,
 
-    fn get(arg: *py.PyObject) PyError!Source {
+    fn get(st: *const State, arg: *py.PyObject) PyError!Source {
         if (try borrowBytes(arg)) |bytes| return .{ .bytes = bytes };
 
         const read = py.PyObject_GetAttrString(arg, "read") orelse {
             py.PyErr_Clear();
-            py.PyErr_SetString(type_error, "expected str, bytes or a file object with read()");
+            py.PyErr_SetString(st.type_error, "expected str, bytes or a file object with read()");
             return error.PythonError;
         };
         defer py.Py_DecRef(read);
         const data = try check(py.PyObject_CallNoArgs(read));
         errdefer py.Py_DecRef(data);
         const bytes = try borrowBytes(data) orelse {
-            py.PyErr_SetString(type_error, "read() must return str or bytes");
+            py.PyErr_SetString(st.type_error, "read() must return str or bytes");
             return error.PythonError;
         };
         return .{ .bytes = bytes, .owner = data };
@@ -135,7 +152,7 @@ const Source = struct {
     }
 };
 
-fn raiseLoadError(err: yaml.Error, diagnostics: []const yaml.Diagnostic, source: []const u8) PyError {
+fn raiseLoadError(st: *const State, err: yaml.Error, diagnostics: []const yaml.Diagnostic, source: []const u8) PyError {
     var buf: [1024]u8 = undefined;
     const msg: [:0]const u8 = switch (err) {
         error.OutOfMemory => {
@@ -154,7 +171,7 @@ fn raiseLoadError(err: yaml.Error, diagnostics: []const yaml.Diagnostic, source:
             break :msg std.mem.printSentinel(&buf, "{s} (line {d}, column {d})", .{ first.message, at.line, at.col }, 0) catch "invalid YAML";
         },
     };
-    py.PyErr_SetString(yaml_error, msg.ptr);
+    py.PyErr_SetString(st.yaml_error, msg.ptr);
     return error.PythonError;
 }
 
@@ -168,6 +185,7 @@ fn raiseLoadError(err: yaml.Error, diagnostics: []const yaml.Diagnostic, source:
 /// reuses it, which also lets Python reuse the string's cached hash when the
 /// key goes into a dict. The cache lives for one load call.
 const Loader = struct {
+    st: *const State,
     keys: std.StringHashMapUnmanaged(*py.PyObject) = .empty,
     hits: usize = 0,
     /// Set when the cache filled up without paying off (mostly unique keys).
@@ -184,7 +202,7 @@ const Loader = struct {
 
     fn convert(self: *Loader, value: yaml.Value) PyError!*py.PyObject {
         return switch (value) {
-            .null => none(),
+            .null => self.st.none(),
             .bool => |b| check(py.PyBool_FromLong(@intFromBool(b))),
             .int => |i| newInt(i),
             .float => |f| check(py.PyFloat_FromDouble(f)),
@@ -233,7 +251,7 @@ const Loader = struct {
     fn setEntry(self: *Loader, dict: *py.PyObject, entry: yaml.Entry) PyError!void {
         switch (entry.key) {
             .seq, .map => {
-                py.PyErr_SetString(yaml_error, "mapping keys that are lists or mappings are not supported");
+                py.PyErr_SetString(self.st.yaml_error, "mapping keys that are lists or mappings are not supported");
                 return error.PythonError;
             },
             else => {},
@@ -252,7 +270,7 @@ const Loader = struct {
             const text = py.PyUnicode_AsUTF8AndSize(repr, null) orelse return error.PythonError;
             var buf: [256]u8 = undefined;
             const msg = std.mem.printSentinel(&buf, "duplicate mapping key: {s}", .{std.mem.span(text)}, 0) catch "duplicate mapping key";
-            py.PyErr_SetString(yaml_error, msg.ptr);
+            py.PyErr_SetString(self.st.yaml_error, msg.ptr);
             return error.PythonError;
         }
     }
@@ -268,15 +286,15 @@ fn newInt(value: i128) PyError!*py.PyObject {
 // ---------------------------------------------------------------------------
 // Dumping: Python objects -> yaml.Value -> YAML text
 
-fn dump(_: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
-    return dumpDocuments(args, kwargs, .first) catch null;
+fn dump(module: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
+    return dumpDocuments(State.of(module), args, kwargs, .first) catch null;
 }
 
-fn dumpAll(_: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
-    return dumpDocuments(args, kwargs, .all) catch null;
+fn dumpAll(module: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
+    return dumpDocuments(State.of(module), args, kwargs, .all) catch null;
 }
 
-fn dumpDocuments(args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!*py.PyObject {
+fn dumpDocuments(st: *const State, args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!*py.PyObject {
     var data: ?*py.PyObject = null;
     var stream: ?*py.PyObject = null;
     var indent: py.Py_ssize_t = 2;
@@ -286,21 +304,21 @@ fn dumpDocuments(args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!
     if (py.PyArg_ParseTupleAndKeywords(args, kwargs, "O|O$npO", @ptrCast(&keywords), &data, &stream, &indent, &sort_keys, &default) == 0) {
         return error.PythonError;
     }
-    if (default == none_obj) default = null;
+    if (default == st.none_obj) default = null;
     if (default) |d| if (py.PyCallable_Check(d) == 0) {
-        py.PyErr_SetString(type_error, "default must be callable");
+        py.PyErr_SetString(st.type_error, "default must be callable");
         return error.PythonError;
     };
     if (indent < 1 or indent > 16) {
-        py.PyErr_SetString(value_error, "indent must be between 1 and 16");
+        py.PyErr_SetString(st.value_error, "indent must be between 1 and 16");
         return error.PythonError;
     }
-    if (stream == none_obj) stream = null;
+    if (stream == st.none_obj) stream = null;
 
     // The GIL stays held until the text is emitted (see Dumper).
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    const dumper: Dumper = .{ .arena = arena_state.allocator(), .default = default };
+    const dumper: Dumper = .{ .st = st, .arena = arena_state.allocator(), .default = default };
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -317,13 +335,13 @@ fn dumpDocuments(args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!
             break :blk yaml.emitStream(&out.writer, try dumper.values(documents), options);
         },
     };
-    result catch |err| return raiseDumpError(err);
+    result catch |err| return raiseDumpError(st, err);
 
     const text = try newString(out.written());
     if (stream) |s| {
         defer py.Py_DecRef(text);
         try writeTo(s, text);
-        return none();
+        return st.none();
     }
     return text;
 }
@@ -339,6 +357,7 @@ const max_dump_depth = 128;
 /// or free the objects being converted, so with it, strings are copied into
 /// the arena and every container being walked is kept alive.
 const Dumper = struct {
+    st: *const State,
     arena: std.mem.Allocator,
     default: ?*py.PyObject,
 
@@ -355,19 +374,19 @@ const Dumper = struct {
 
     fn value(self: Dumper, obj: *py.PyObject, depth: usize) PyError!yaml.Value {
         if (depth > max_dump_depth) {
-            py.PyErr_SetString(value_error, "data is nested more than 128 levels deep, or contains itself");
+            py.PyErr_SetString(self.st.value_error, "data is nested more than 128 levels deep, or contains itself");
             return error.PythonError;
         }
-        if (obj == none_obj) return .null;
-        if (obj == true_obj) return .{ .bool = true };
-        if (obj == false_obj) return .{ .bool = false };
+        if (obj == self.st.none_obj) return .null;
+        if (obj == self.st.true_obj) return .{ .bool = true };
+        if (obj == self.st.false_obj) return .{ .bool = false };
         if (py.PyUnicode_Check(obj) != 0) return .{ .string = try self.string(obj) };
-        if (py.PyLong_Check(obj) != 0) return .{ .int = try toInt(obj) };
+        if (py.PyLong_Check(obj) != 0) return .{ .int = try toInt(self.st, obj) };
         if (py.PyDict_Check(obj) != 0) return self.map(obj, depth);
         if (py.PyList_Check(obj) != 0 or py.PyTuple_Check(obj) != 0) return self.seq(obj, depth);
-        if (isFloat(obj)) return .{ .float = py.PyFloat_AsDouble(obj) };
+        if (isFloat(self.st, obj)) return .{ .float = py.PyFloat_AsDouble(obj) };
 
-        const default = self.default orelse return typeError("cannot dump objects of type", obj);
+        const default = self.default orelse return typeError(self.st, "cannot dump objects of type", obj);
         const call_args = try check(py.PyTuple_Pack(1, obj));
         defer py.Py_DecRef(call_args);
         const replacement = try check(py.PyObject_CallObject(default, call_args));
@@ -386,19 +405,19 @@ const Dumper = struct {
         var val: [*c]py.PyObject = null;
         var i: usize = 0;
         while (py.PyDict_Next(obj, &pos, &key, &val) != 0) : (i += 1) {
-            if (i == entries.len) return changedDuringDump();
+            if (i == entries.len) return changedDuringDump(self.st);
             self.hold(key);
             defer self.release(key);
             self.hold(val);
             defer self.release(val);
             const k = try self.value(key, depth + 1);
             switch (k) {
-                .seq, .map => return typeError("mapping keys must be str, int, float, bool or None, not", key),
+                .seq, .map => return typeError(self.st, "mapping keys must be str, int, float, bool or None, not", key),
                 else => {},
             }
             entries[i] = .{ .key = k, .value = try self.value(val, depth + 1) };
         }
-        if (i != entries.len) return changedDuringDump();
+        if (i != entries.len) return changedDuringDump(self.st);
         return .{ .map = entries };
     }
 
@@ -434,17 +453,17 @@ const Dumper = struct {
     }
 };
 
-fn changedDuringDump() PyError {
-    py.PyErr_SetString(runtime_error, "dictionary changed size during dump");
+fn changedDuringDump(st: *const State) PyError {
+    py.PyErr_SetString(st.runtime_error, "dictionary changed size during dump");
     return error.PythonError;
 }
 
 /// Whether obj's real type is float or a subclass. Unlike isinstance(), this
 /// never consults obj.__class__, which can run Python code and fail.
-fn isFloat(obj: *py.PyObject) bool {
+fn isFloat(st: *const State, obj: *py.PyObject) bool {
     const obj_type = py.PyObject_Type(obj) orelse return false; // cannot fail for a live object
     defer py.Py_DecRef(obj_type);
-    return py.PyType_IsSubtype(@ptrCast(obj_type), @ptrCast(float_type)) != 0;
+    return py.PyType_IsSubtype(@ptrCast(obj_type), @ptrCast(st.float_type)) != 0;
 }
 
 fn utf8(obj: *py.PyObject) PyError![]const u8 {
@@ -453,7 +472,7 @@ fn utf8(obj: *py.PyObject) PyError![]const u8 {
     return ptr[0..@intCast(len)];
 }
 
-fn toInt(obj: *py.PyObject) PyError!i128 {
+fn toInt(st: *const State, obj: *py.PyObject) PyError!i128 {
     var overflow: c_int = 0;
     const small = py.PyLong_AsLongLongAndOverflow(obj, &overflow);
     if (overflow == 0) {
@@ -464,7 +483,7 @@ fn toInt(obj: *py.PyObject) PyError!i128 {
     const digits = try check(py.PyNumber_ToBase(obj, 10));
     defer py.Py_DecRef(digits);
     return std.fmt.parseInt(i128, try utf8(digits), 10) catch {
-        py.PyErr_SetString(value_error, "integers wider than 128 bits cannot be dumped");
+        py.PyErr_SetString(st.value_error, "integers wider than 128 bits cannot be dumped");
         return error.PythonError;
     };
 }
@@ -478,18 +497,18 @@ fn writeTo(stream: *py.PyObject, text: *py.PyObject) PyError!void {
     py.Py_DecRef(result);
 }
 
-fn raiseDumpError(err: yaml.EmitError) PyError {
+fn raiseDumpError(st: *const State, err: yaml.EmitError) PyError {
     switch (err) {
         error.OutOfMemory, error.WriteFailed => return noMemory(),
-        error.NestingTooDeep => py.PyErr_SetString(value_error, "data is nested more than 128 levels deep"),
-        error.InvalidUtf8 => py.PyErr_SetString(value_error, "string is not valid UTF-8"),
-        error.UnrepresentableInt => py.PyErr_SetString(value_error, "integers wider than 128 bits cannot be dumped"),
-        error.UnrepresentableScalar => py.PyErr_SetString(value_error, "value cannot be represented in YAML"),
+        error.NestingTooDeep => py.PyErr_SetString(st.value_error, "data is nested more than 128 levels deep"),
+        error.InvalidUtf8 => py.PyErr_SetString(st.value_error, "string is not valid UTF-8"),
+        error.UnrepresentableInt => py.PyErr_SetString(st.value_error, "integers wider than 128 bits cannot be dumped"),
+        error.UnrepresentableScalar => py.PyErr_SetString(st.value_error, "value cannot be represented in YAML"),
     }
     return error.PythonError;
 }
 
-fn typeError(comptime prefix: [:0]const u8, obj: *py.PyObject) PyError {
+fn typeError(st: *const State, comptime prefix: [:0]const u8, obj: *py.PyObject) PyError {
     const type_obj = py.PyObject_Type(obj) orelse return error.PythonError;
     defer py.Py_DecRef(type_obj);
     const name = py.PyObject_GetAttrString(type_obj, "__name__") orelse return error.PythonError;
@@ -497,7 +516,7 @@ fn typeError(comptime prefix: [:0]const u8, obj: *py.PyObject) PyError {
     const text = utf8(name) catch return error.PythonError;
     var buf: [256]u8 = undefined;
     const msg = std.mem.printSentinel(&buf, prefix ++ " {s}", .{text}, 0) catch prefix;
-    py.PyErr_SetString(type_error, msg.ptr);
+    py.PyErr_SetString(st.type_error, msg.ptr);
     return error.PythonError;
 }
 
@@ -511,11 +530,6 @@ fn noMemory() PyError {
 
 fn check(obj: ?*py.PyObject) PyError!*py.PyObject {
     return obj orelse error.PythonError;
-}
-
-fn none() *py.PyObject {
-    py.Py_IncRef(none_obj);
-    return none_obj.?;
 }
 
 fn newString(s: []const u8) PyError!*py.PyObject {
@@ -533,24 +547,45 @@ fn builtin(name: [*:0]const u8) ?*py.PyObject {
 }
 
 fn moduleExec(module: [*c]py.PyObject) callconv(.c) c_int {
-    // These references are kept for the life of the process.
-    if (none_obj == null) none_obj = py.Py_BuildValue("") orelse return -1;
-    if (value_error == null) value_error = builtin("ValueError") orelse return -1;
-    if (type_error == null) type_error = builtin("TypeError") orelse return -1;
-    if (runtime_error == null) runtime_error = builtin("RuntimeError") orelse return -1;
-    if (true_obj == null) true_obj = py.PyBool_FromLong(1) orelse return -1;
-    if (false_obj == null) false_obj = py.PyBool_FromLong(0) orelse return -1;
-    if (float_type == null) float_type = builtin("float") orelse return -1;
-    if (yaml_error == null) {
-        yaml_error = py.PyErr_NewException("zaml.YAMLError", value_error, null);
-        if (yaml_error == null) return -1;
-    }
-    py.Py_IncRef(yaml_error);
-    if (py.PyModule_AddObject(module, "YAMLError", yaml_error) < 0) {
-        py.Py_DecRef(yaml_error);
-        return -1;
+    const st = State.of(module);
+    st.none_obj = py.Py_BuildValue("") orelse return -1;
+    st.true_obj = py.PyBool_FromLong(1) orelse return -1;
+    st.false_obj = py.PyBool_FromLong(0) orelse return -1;
+    st.value_error = builtin("ValueError") orelse return -1;
+    st.type_error = builtin("TypeError") orelse return -1;
+    st.runtime_error = builtin("RuntimeError") orelse return -1;
+    st.float_type = builtin("float") orelse return -1;
+    st.yaml_error = py.PyErr_NewException("zaml.YAMLError", st.value_error, null) orelse return -1;
+    return py.PyModule_AddObjectRef(module, "YAMLError", st.yaml_error);
+}
+
+/// Lets the garbage collector see the references the state holds.
+fn moduleTraverse(module: [*c]py.PyObject, visit: py.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const raw = py.PyModule_GetState(module) orelse return 0;
+    const st: *State = @ptrCast(@alignCast(raw));
+    inline for (State.fields) |name| {
+        if (@field(st, name)) |obj| {
+            const result = visit.?(obj, arg);
+            if (result != 0) return result;
+        }
     }
     return 0;
+}
+
+fn moduleClear(module: [*c]py.PyObject) callconv(.c) c_int {
+    const raw = py.PyModule_GetState(module) orelse return 0;
+    const st: *State = @ptrCast(@alignCast(raw));
+    inline for (State.fields) |name| {
+        if (@field(st, name)) |obj| {
+            @field(st, name) = null;
+            py.Py_DecRef(obj);
+        }
+    }
+    return 0;
+}
+
+fn moduleFree(module: ?*anyopaque) callconv(.c) void {
+    _ = moduleClear(@ptrCast(@alignCast(module)));
 }
 
 var methods = [_]py.PyMethodDef{
@@ -586,26 +621,57 @@ var methods = [_]py.PyMethodDef{
     std.mem.zeroes(py.PyMethodDef),
 };
 
-var slots = [_]py.PyModuleDef_Slot{
+// Python 3.12 added the slot that declares support for interpreters with
+// their own GIL; 3.10 and 3.11 reject it as unknown. zaml targets the 3.10
+// stable ABI, so it carries two definitions and picks one at import.
+const mod_multiple_interpreters = 3; // Py_mod_multiple_interpreters
+const per_interpreter_gil_supported: ?*anyopaque = @ptrFromInt(2); // Py_MOD_PER_INTERPRETER_GIL_SUPPORTED
+
+var slots_310 = [_]py.PyModuleDef_Slot{
     .{ .slot = py.Py_mod_exec, .value = @ptrCast(@constCast(&moduleExec)) },
     std.mem.zeroes(py.PyModuleDef_Slot),
 };
 
-var module_def: py.PyModuleDef = .{
-    .m_base = std.mem.zeroes(py.PyModuleDef_Base),
-    .m_name = "zaml._zaml",
-    .m_doc = "Fast YAML 1.2 parsing and dumping for Python, written in Zig.",
-    .m_size = 0,
-    .m_methods = &methods,
-    .m_slots = &slots,
-    .m_traverse = null,
-    .m_clear = null,
-    .m_free = null,
+var slots_312 = [_]py.PyModuleDef_Slot{
+    .{ .slot = py.Py_mod_exec, .value = @ptrCast(@constCast(&moduleExec)) },
+    .{ .slot = mod_multiple_interpreters, .value = per_interpreter_gil_supported },
+    std.mem.zeroes(py.PyModuleDef_Slot),
 };
 
+fn moduleDef(slots: [*c]py.PyModuleDef_Slot) py.PyModuleDef {
+    return .{
+        .m_base = std.mem.zeroes(py.PyModuleDef_Base),
+        .m_name = "zaml._zaml",
+        .m_doc = "Fast YAML 1.2 parsing and dumping for Python, written in Zig.",
+        .m_size = @sizeOf(State),
+        .m_methods = &methods,
+        .m_slots = slots,
+        .m_traverse = moduleTraverse,
+        .m_clear = moduleClear,
+        .m_free = moduleFree,
+    };
+}
+
+var module_def_310 = moduleDef(&slots_310);
+var module_def_312 = moduleDef(&slots_312);
+var def_ref_taken = std.atomic.Value(bool).init(false);
+
+/// The running interpreter's minor version, from Py_GetVersion() ("3.12.5 ...").
+fn runtimeMinorVersion() u32 {
+    const version = std.mem.span(py.Py_GetVersion());
+    var parts = std.mem.splitScalar(u8, version, '.');
+    _ = parts.next(); // major
+    const minor = parts.next() orelse return 0;
+    var digits: usize = 0;
+    while (digits < minor.len and std.ascii.isDigit(minor[digits])) digits += 1;
+    return std.fmt.parseInt(u32, minor[0..digits], 10) catch 0;
+}
+
 pub export fn PyInit__zaml() callconv(.c) ?*py.PyObject {
-    // Equivalent of PyModuleDef_HEAD_INIT: the definition starts with one reference.
-    const def_obj: *py.PyObject = @ptrCast(&module_def);
-    if (module_def.m_base.m_index == 0) py.Py_IncRef(def_obj);
-    return py.PyModuleDef_Init(&module_def);
+    const def = if (runtimeMinorVersion() >= 12) &module_def_312 else &module_def_310;
+    // Equivalent of PyModuleDef_HEAD_INIT: the definition holds one reference.
+    // Imports in interpreters with their own GIL can run concurrently, so
+    // exactly one of them takes it.
+    if (!def_ref_taken.swap(true, .acq_rel)) py.Py_IncRef(@ptrCast(def));
+    return py.PyModuleDef_Init(def);
 }

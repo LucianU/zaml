@@ -601,3 +601,35 @@ def test_dump_ignores_class_property_that_raises():
             raise RuntimeError("must not be called")
 
     assert zaml.load(zaml.dump([Bad(a=1)])) == [{"a": 1}]
+
+
+# ---------------------------------------------------------------------------
+# Subinterpreters: each interpreter gets its own module state
+
+def test_isolated_subinterpreters():
+    interpreters = pytest.importorskip("concurrent.interpreters")  # Python 3.14+
+    probe = """
+import zaml
+assert zaml.load(zaml.dump({"a": [1, 2.5, "x"]})) == {"a": [1, 2.5, "x"]}
+try:
+    zaml.load("a: [1")
+except zaml.YAMLError:
+    pass
+"""
+    interps = [interpreters.create() for _ in range(2)]
+    try:
+        for interp in interps:
+            interp.exec(probe)
+        # Each interpreter, and this one, has its own exception class.
+        ids = {interp.call(_yaml_error_id) for interp in interps}
+        ids.add(_yaml_error_id())
+        assert len(ids) == 3
+    finally:
+        for interp in interps:
+            interp.close()
+
+
+def _yaml_error_id():
+    import zaml
+
+    return id(zaml.YAMLError)
