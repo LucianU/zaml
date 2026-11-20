@@ -23,6 +23,7 @@ Issues = "https://github.com/LucianU/zaml/issues"
 
 [dependency-groups]
 dev = ["pytest", "pyyaml", "ruamel.yaml"]
+bench = ["pyyaml", "ruamel.yaml", "yamlrocks", "yaml-rs", "py-yaml12", "ryaml"]
 
 [tool.cibuildwheel]
 # One stable-ABI (abi3) wheel per platform covers CPython 3.10+.

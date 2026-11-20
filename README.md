@@ -1,8 +1,9 @@
-# 🚀 zaml
+# zaml
 
-**Fast YAML for Python, written in Zig.** zaml reads YAML about 11× faster
-than PyYAML's C loader, and writes it about 24× faster, using plain Python
-dicts, lists, strings and numbers.
+**Fast YAML for Python, written in Zig.** zaml reads YAML 12–20× faster than
+PyYAML's C loader and writes it 26–40× faster, on par with the fastest
+Rust-based YAML libraries. It works with plain Python dicts, lists, strings
+and numbers.
 
 ```python
 import zaml
@@ -181,15 +182,40 @@ zaml.dump({"tags": {"zig", "yaml"}}, default=default)
 
 ## Performance
 
-Reading and writing a 1,000,000-key mapping (16.8 MB of YAML) on an Apple
-Silicon Mac, Python 3.13:
+Best of three runs on an Apple Silicon Mac with Python 3.13. "Load" parses YAML
+text into Python objects; "dump" turns them back into YAML text.
 
-| Library | Read | Write |
+**Flat mapping:** 1,000,000 keys with short string values (16.8 MB of YAML).
+
+| Library | Load | Dump |
 | --- | --- | --- |
-| **zaml** | **0.44 s** | **0.17 s** |
-| PyYAML (C) | 5.35 s | 4.10 s |
-| PyYAML (pure Python) | 31.20 s | 18.11 s |
-| ruamel.yaml (safe) | 44.22 s | 31.36 s |
+| **zaml** | **0.41 s** | **0.17 s** |
+| [YAMLRocks](https://github.com/frenck/yamlrocks) (Rust) | 0.58 s | 0.17 s |
+| [yaml-rs](https://github.com/lava-sh/yaml-rs) (Rust) | 0.52 s | 0.26 s |
+| [py-yaml12](https://github.com/posit-dev/py-yaml12) (Rust) | 0.92 s | 0.32 s ⚠️ |
+| [ryaml](https://github.com/emmatyping/ryaml) (Rust) | 0.97 s | 0.53 s ⚠️ |
+| PyYAML (C) | 5.03 s | 4.47 s |
+| PyYAML (pure Python) | 31.55 s | 17.92 s |
+| ruamel.yaml | 45.45 s | 32.09 s ⚠️ |
+
+**Config-like:** 50,000 records of nested maps, lists, numbers, booleans,
+nulls and strings (9.9 MB of YAML).
+
+| Library | Load | Dump |
+| --- | --- | --- |
+| zaml | 0.23 s | **0.10 s** |
+| YAMLRocks | **0.19 s** | 0.13 s |
+| yaml-rs | 0.31 s | 0.16 s |
+| py-yaml12 | 0.45 s | 0.19 s ⚠️ |
+| ryaml | 0.52 s | 0.28 s ⚠️ |
+| PyYAML (C) | 4.56 s | 3.95 s |
+| PyYAML (pure Python) | 23.90 s | 12.10 s |
+| ruamel.yaml | 33.42 s | 24.06 s ⚠️ |
+
+zaml and YAMLRocks are the fastest, each ahead in some cases. Every library
+loaded both documents correctly. ⚠️ marks dumps that PyYAML reads back
+differently: those libraries write strings such as `yes` without quotes, which
+YAML 1.1 readers like PyYAML turn into booleans. zaml quotes them.
 
 zaml also lets other Python threads run while it parses. To run the benchmark
 yourself, see [Development](#development).
@@ -243,6 +269,13 @@ cd zaml
 uv venv --python 3.13
 uv pip install . --group dev
 pytest tests
+```
+
+To run the benchmark, install the other libraries it compares against, then
+run it (`--slow` adds pure-Python PyYAML and ruamel.yaml):
+
+```bash
+uv pip install . --group bench
 python benchmark/benchmark.py
 ```
 
@@ -262,7 +295,7 @@ Set `ZIG=/path/to/zig` to build with a different Zig binary.
 | `build.zig`, `build.zig.zon` | Build the shared library; `build.zig.zon` pins the yaml-zig commit |
 | `setup.py` | setuptools `build_ext` that calls `zig build` |
 | `tests/` | pytest suite |
-| `benchmark/benchmark.py` | Comparison with PyYAML and ruamel.yaml |
+| `benchmark/benchmark.py` | Load and dump comparison with PyYAML and Rust-based YAML libraries |
 
 CI runs the tests on Linux and Windows for every push. Wheels for all
 platforms build on a release, or from **Run workflow** in the Actions tab.
