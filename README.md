@@ -1,7 +1,7 @@
 # zaml
 
-**Fast YAML for Python, written in Zig.** zaml reads YAML 12–20× faster than
-PyYAML's C loader and writes it 26–40× faster, on par with the fastest
+**Fast YAML for Python, written in Zig.** zaml reads YAML 12–24× faster than
+PyYAML's C loader and writes it 25–37× faster, on par with the fastest
 Rust-based YAML libraries. It works with plain Python dicts, lists, strings
 and numbers.
 
@@ -189,28 +189,28 @@ text into Python objects; "dump" turns them back into YAML text.
 
 | Library | Load | Dump |
 | --- | --- | --- |
-| **zaml** | **0.41 s** | **0.17 s** |
-| [YAMLRocks](https://github.com/frenck/yamlrocks) (Rust) | 0.58 s | 0.17 s |
-| [yaml-rs](https://github.com/lava-sh/yaml-rs) (Rust) | 0.52 s | 0.26 s |
-| [py-yaml12](https://github.com/posit-dev/py-yaml12) (Rust) | 0.92 s | 0.32 s ⚠️ |
-| [ryaml](https://github.com/emmatyping/ryaml) (Rust) | 0.97 s | 0.53 s ⚠️ |
-| PyYAML (C) | 5.03 s | 4.47 s |
-| PyYAML (pure Python) | 31.55 s | 17.92 s |
-| ruamel.yaml | 45.45 s | 32.09 s ⚠️ |
+| **zaml** | **0.42 s** | 0.17 s |
+| [YAMLRocks](https://github.com/frenck/yamlrocks) (Rust) | 0.57 s | **0.16 s** |
+| [yaml-rs](https://github.com/lava-sh/yaml-rs) (Rust) | 0.56 s | 0.26 s |
+| [py-yaml12](https://github.com/posit-dev/py-yaml12) (Rust) | 0.99 s | 0.34 s ⚠️ |
+| [ryaml](https://github.com/emmatyping/ryaml) (Rust) | 1.01 s | 0.52 s ⚠️ |
+| PyYAML (C) | 5.19 s | 4.27 s |
+| PyYAML (pure Python) | 31.92 s | 17.69 s |
+| ruamel.yaml | 45.00 s | 32.06 s ⚠️ |
 
 **Config-like:** 50,000 records of nested maps, lists, numbers, booleans,
 nulls and strings (9.9 MB of YAML).
 
 | Library | Load | Dump |
 | --- | --- | --- |
-| zaml | 0.23 s | **0.10 s** |
-| YAMLRocks | **0.19 s** | 0.13 s |
+| zaml | 0.20 s | **0.10 s** |
+| YAMLRocks | **0.18 s** | 0.12 s |
 | yaml-rs | 0.31 s | 0.16 s |
-| py-yaml12 | 0.45 s | 0.19 s ⚠️ |
-| ryaml | 0.52 s | 0.28 s ⚠️ |
-| PyYAML (C) | 4.56 s | 3.95 s |
-| PyYAML (pure Python) | 23.90 s | 12.10 s |
-| ruamel.yaml | 33.42 s | 24.06 s ⚠️ |
+| py-yaml12 | 0.43 s | 0.18 s ⚠️ |
+| ryaml | 0.51 s | 0.27 s ⚠️ |
+| PyYAML (C) | 4.71 s | 3.71 s |
+| PyYAML (pure Python) | 24.29 s | 12.07 s |
+| ruamel.yaml | 34.32 s | 24.55 s ⚠️ |
 
 zaml and YAMLRocks are the fastest, each ahead in some cases. Every library
 loaded both documents correctly. ⚠️ marks dumps that PyYAML reads back

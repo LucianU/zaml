@@ -64,17 +64,19 @@ fn loadDocuments(args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!
 
     const docs = result catch |err| return raiseLoadError(err, diagnostics.items, source.bytes);
 
+    var loader: Loader = .{};
+    defer loader.deinit();
     switch (mode) {
         .first => {
             if (docs.len == 0) return none();
-            return convert(docs[0]);
+            return loader.convert(docs[0]);
         },
         .all => {
             const list = try check(py.PyList_New(@intCast(docs.len)));
             errdefer py.Py_DecRef(list);
             for (docs, 0..) |doc, i| {
                 // PyList_SetItem steals the reference, even on failure.
-                if (py.PyList_SetItem(list, @intCast(i), try convert(doc)) < 0) return error.PythonError;
+                if (py.PyList_SetItem(list, @intCast(i), try loader.convert(doc)) < 0) return error.PythonError;
             }
             return list;
         },
@@ -159,56 +161,102 @@ fn raiseLoadError(err: yaml.Error, diagnostics: []const yaml.Diagnostic, source:
 // ---------------------------------------------------------------------------
 // yaml.Value -> Python objects
 
-fn convert(value: yaml.Value) PyError!*py.PyObject {
-    return switch (value) {
-        .null => none(),
-        .bool => |b| check(py.PyBool_FromLong(@intFromBool(b))),
-        .int => |i| newInt(i),
-        .float => |f| check(py.PyFloat_FromDouble(f)),
-        .string => |s| newString(s),
-        .seq => |items| {
-            const list = try check(py.PyList_New(@intCast(items.len)));
-            errdefer py.Py_DecRef(list);
-            for (items, 0..) |item, i| {
-                if (py.PyList_SetItem(list, @intCast(i), try convert(item)) < 0) return error.PythonError;
-            }
-            return list;
-        },
-        .map => |entries| {
-            const dict = try check(py.PyDict_New());
-            errdefer py.Py_DecRef(dict);
-            for (entries) |entry| try setEntry(dict, entry);
-            return dict;
-        },
-    };
-}
+/// Converts yaml.Values to Python objects.
+///
+/// Mapping keys repeat a lot in real documents (every record has an "id", a
+/// "name"...). The loader creates one Python string per distinct short key and
+/// reuses it, which also lets Python reuse the string's cached hash when the
+/// key goes into a dict. The cache lives for one load call.
+const Loader = struct {
+    keys: std.StringHashMapUnmanaged(*py.PyObject) = .empty,
+    hits: usize = 0,
+    /// Set when the cache filled up without paying off (mostly unique keys).
+    disabled: bool = false,
 
-fn setEntry(dict: *py.PyObject, entry: yaml.Entry) PyError!void {
-    switch (entry.key) {
-        .seq, .map => {
-            py.PyErr_SetString(yaml_error, "mapping keys that are lists or mappings are not supported");
+    const max_key_len = 64;
+    const max_keys = 4096;
+
+    fn deinit(self: *Loader) void {
+        var it = self.keys.valueIterator();
+        while (it.next()) |obj| py.Py_DecRef(obj.*);
+        self.keys.deinit(gpa);
+    }
+
+    fn convert(self: *Loader, value: yaml.Value) PyError!*py.PyObject {
+        return switch (value) {
+            .null => none(),
+            .bool => |b| check(py.PyBool_FromLong(@intFromBool(b))),
+            .int => |i| newInt(i),
+            .float => |f| check(py.PyFloat_FromDouble(f)),
+            .string => |s| newString(s),
+            .seq => |items| {
+                const list = try check(py.PyList_New(@intCast(items.len)));
+                errdefer py.Py_DecRef(list);
+                for (items, 0..) |item, i| {
+                    if (py.PyList_SetItem(list, @intCast(i), try self.convert(item)) < 0) return error.PythonError;
+                }
+                return list;
+            },
+            .map => |entries| {
+                const dict = try check(py.PyDict_New());
+                errdefer py.Py_DecRef(dict);
+                for (entries) |entry| try self.setEntry(dict, entry);
+                return dict;
+            },
+        };
+    }
+
+    /// A new reference to the Python object for a mapping key.
+    fn key(self: *Loader, value: yaml.Value) PyError!*py.PyObject {
+        const text = switch (value) {
+            .string => |s| s,
+            else => return self.convert(value),
+        };
+        if (self.disabled or text.len > max_key_len) return newString(text);
+
+        if (self.keys.get(text)) |cached| {
+            self.hits += 1;
+            py.Py_IncRef(cached);
+            return cached;
+        }
+        const obj = try newString(text);
+        if (self.keys.count() < max_keys) {
+            self.keys.put(gpa, text, obj) catch return obj; // caching is optional
+            py.Py_IncRef(obj); // the cache's own reference
+        } else if (self.hits < max_keys / 4) {
+            // Full, and keys rarely repeat: stop paying for lookups.
+            self.disabled = true;
+        }
+        return obj;
+    }
+
+    fn setEntry(self: *Loader, dict: *py.PyObject, entry: yaml.Entry) PyError!void {
+        switch (entry.key) {
+            .seq, .map => {
+                py.PyErr_SetString(yaml_error, "mapping keys that are lists or mappings are not supported");
+                return error.PythonError;
+            },
+            else => {},
+        }
+        const k = try self.key(entry.key);
+        defer py.Py_DecRef(k);
+        const val = try self.convert(entry.value);
+        defer py.Py_DecRef(val);
+
+        const size_before = py.PyDict_Size(dict);
+        if (py.PyDict_SetItem(dict, k, val) < 0) return error.PythonError;
+        if (py.PyDict_Size(dict) == size_before) {
+            // Distinct YAML keys can still be equal in Python (e.g. 1 and true).
+            const repr = try check(py.PyObject_Repr(k));
+            defer py.Py_DecRef(repr);
+            const text = py.PyUnicode_AsUTF8AndSize(repr, null) orelse return error.PythonError;
+            var buf: [256]u8 = undefined;
+            const msg = std.mem.printSentinel(&buf, "duplicate mapping key: {s}", .{std.mem.span(text)}, 0) catch "duplicate mapping key";
+            py.PyErr_SetString(yaml_error, msg.ptr);
             return error.PythonError;
-        },
-        else => {},
+        }
     }
-    const key = try convert(entry.key);
-    defer py.Py_DecRef(key);
-    const val = try convert(entry.value);
-    defer py.Py_DecRef(val);
-
-    const size_before = py.PyDict_Size(dict);
-    if (py.PyDict_SetItem(dict, key, val) < 0) return error.PythonError;
-    if (py.PyDict_Size(dict) == size_before) {
-        // Distinct YAML keys can still be equal in Python (e.g. 1 and true).
-        const repr = try check(py.PyObject_Repr(key));
-        defer py.Py_DecRef(repr);
-        const text = py.PyUnicode_AsUTF8AndSize(repr, null) orelse return error.PythonError;
-        var buf: [256]u8 = undefined;
-        const msg = std.mem.printSentinel(&buf, "duplicate mapping key: {s}", .{std.mem.span(text)}, 0) catch "duplicate mapping key";
-        py.PyErr_SetString(yaml_error, msg.ptr);
-        return error.PythonError;
-    }
-}
+};
 
 fn newInt(value: i128) PyError!*py.PyObject {
     if (std.math.cast(i64, value)) |small| return check(py.PyLong_FromLongLong(small));

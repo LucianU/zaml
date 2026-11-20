@@ -514,3 +514,30 @@ def test_default_freeing_strings_already_converted():
 
     text = zaml.dump(data, default=default)
     assert zaml.load(text) == {"first": "z" * 1000, "obj": "replaced"}
+
+
+# ---------------------------------------------------------------------------
+# Repeated mapping keys share one Python string per load
+
+def test_repeated_keys_share_one_string():
+    records = zaml.load("- {name: a, id: 1}\n- {name: b, id: 2}\n- {name: c, id: 3}\n")
+    first_keys = list(records[0])
+    for record in records[1:]:
+        assert all(k1 is k2 for k1, k2 in zip(first_keys, record))
+
+
+def test_many_unique_keys_after_cache_fills():
+    # More distinct keys than the cache holds, then repeats of early and late keys.
+    data = {f"key{i}": {"x": i} for i in range(10_000)}
+    text = zaml.dump(data)
+    assert zaml.load(text) == data
+
+
+def test_long_keys_are_not_cached_but_load():
+    long_key = "k" * 100
+    assert zaml.load(f"- {{{long_key}: 1}}\n- {{{long_key}: 2}}\n") == [{long_key: 1}, {long_key: 2}]
+
+
+def test_duplicate_key_error_with_cached_keys():
+    with pytest.raises(zaml.YAMLError, match="duplicate"):
+        zaml.load("- {a: 1}\n- {a: 1, b: 2, a: 3}\n")
