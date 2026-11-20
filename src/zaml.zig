@@ -33,8 +33,20 @@ const State = extern struct {
 
     const fields = @typeInfo(State).@"struct".field_names;
 
-    fn of(module: *py.PyObject) *State {
-        return @ptrCast(@alignCast(py.PyModule_GetState(module).?));
+    /// The state of a fully initialized module. Fails with RuntimeError when
+    /// the module was created but not executed (importlib's module_from_spec
+    /// without exec_module) or has already been cleared: its methods exist,
+    /// but the objects they need do not.
+    fn of(module: *py.PyObject) PyError!*const State {
+        if (py.PyModule_GetState(module)) |raw| {
+            const st: *const State = @ptrCast(@alignCast(raw));
+            if (st.yaml_error != null) return st; // moduleExec sets it last
+        }
+        if (builtin("RuntimeError")) |runtime_error| {
+            defer py.Py_DecRef(runtime_error);
+            py.PyErr_SetString(runtime_error, "zaml._zaml is not initialized");
+        }
+        return error.PythonError;
     }
 
     /// A new reference to None.
@@ -48,11 +60,13 @@ const State = extern struct {
 // Python entry points
 
 fn load(module: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
-    return loadDocuments(State.of(module), args, kwargs, .first) catch null;
+    const st = State.of(module) catch return null;
+    return loadDocuments(st, args, kwargs, .first) catch null;
 }
 
 fn loadAll(module: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
-    return loadDocuments(State.of(module), args, kwargs, .all) catch null;
+    const st = State.of(module) catch return null;
+    return loadDocuments(st, args, kwargs, .all) catch null;
 }
 
 const Mode = enum { first, all };
@@ -287,11 +301,13 @@ fn newInt(value: i128) PyError!*py.PyObject {
 // Dumping: Python objects -> yaml.Value -> YAML text
 
 fn dump(module: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
-    return dumpDocuments(State.of(module), args, kwargs, .first) catch null;
+    const st = State.of(module) catch return null;
+    return dumpDocuments(st, args, kwargs, .first) catch null;
 }
 
 fn dumpAll(module: [*c]py.PyObject, args: [*c]py.PyObject, kwargs: [*c]py.PyObject) callconv(.c) [*c]py.PyObject {
-    return dumpDocuments(State.of(module), args, kwargs, .all) catch null;
+    const st = State.of(module) catch return null;
+    return dumpDocuments(st, args, kwargs, .all) catch null;
 }
 
 fn dumpDocuments(st: *const State, args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!*py.PyObject {
@@ -318,7 +334,15 @@ fn dumpDocuments(st: *const State, args: *py.PyObject, kwargs: ?*py.PyObject, mo
     // The GIL stays held until the text is emitted (see Dumper).
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    const dumper: Dumper = .{ .st = st, .arena = arena_state.allocator(), .default = default };
+    const dumper: Dumper = .{
+        .st = st,
+        .arena = arena_state.allocator(),
+        .default = default,
+        // dump_all runs the caller's iterator between documents, which may
+        // change or free a document already converted (a generator often
+        // reuses one dict), so its strings are copied, like with default.
+        .copy_strings = default != null or mode == .all,
+    };
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -326,14 +350,7 @@ fn dumpDocuments(st: *const State, args: *py.PyObject, kwargs: ?*py.PyObject, mo
 
     const result = switch (mode) {
         .first => yaml.emit(&out.writer, try dumper.value(data.?, 0), options),
-        .all => blk: {
-            // Collect the documents first: an iterator's documents may be
-            // referenced nowhere else, and the value tree borrows their
-            // strings until emitStream has written them.
-            const documents = try check(py.PySequence_List(data.?));
-            defer py.Py_DecRef(documents);
-            break :blk yaml.emitStream(&out.writer, try dumper.values(documents), options);
-        },
+        .all => yaml.emitStream(&out.writer, try dumper.values(data.?), options),
     };
     result catch |err| return raiseDumpError(st, err);
 
@@ -351,25 +368,31 @@ const max_dump_depth = 128;
 
 /// Converts Python objects to yaml.Values for the emitter.
 ///
-/// Without `default`, no Python code runs during conversion, so the value tree
-/// can borrow string data from the Python objects (the GIL stays held until
-/// the text is emitted). `default` is arbitrary Python code that could change
-/// or free the objects being converted, so with it, strings are copied into
-/// the arena and every container being walked is kept alive.
+/// Without `default`, no Python code runs while a document is converted, so
+/// for dump() the value tree can borrow string data from the Python objects
+/// (the GIL stays held until the text is emitted). `default` is arbitrary
+/// Python code that could change or free the objects being converted, so with
+/// it every container being walked is kept alive, and strings are copied into
+/// the arena; dump_all() copies strings too (see dumpDocuments).
 const Dumper = struct {
     st: *const State,
     arena: std.mem.Allocator,
     default: ?*py.PyObject,
+    copy_strings: bool,
 
-    /// `documents` is a list zaml owns, which keeps every document alive.
+    /// Converts each document as the iterable yields it, like PyYAML: a
+    /// document changed after being yielded is written as it was then.
     fn values(self: Dumper, documents: *py.PyObject) PyError![]yaml.Value {
-        const len: usize = @intCast(py.PyList_Size(documents));
-        const items = self.arena.alloc(yaml.Value, len) catch return noMemory();
-        for (items, 0..) |*item, i| {
-            const doc = py.PyList_GetItem(documents, @intCast(i)) orelse return error.PythonError;
-            item.* = try self.value(doc, 0);
+        std.debug.assert(self.copy_strings); // the iterator runs between documents
+        const iter = py.PyObject_GetIter(documents) orelse return error.PythonError;
+        defer py.Py_DecRef(iter);
+        var list: std.ArrayList(yaml.Value) = .empty;
+        while (py.PyIter_Next(iter)) |doc| {
+            defer py.Py_DecRef(doc);
+            list.append(self.arena, try self.value(doc, 0)) catch return noMemory();
         }
-        return items;
+        if (py.PyErr_Occurred() != null) return error.PythonError;
+        return list.items;
     }
 
     fn value(self: Dumper, obj: *py.PyObject, depth: usize) PyError!yaml.Value {
@@ -439,7 +462,7 @@ const Dumper = struct {
 
     fn string(self: Dumper, obj: *py.PyObject) PyError![]const u8 {
         const text = try utf8(obj);
-        if (self.default == null) return text;
+        if (!self.copy_strings) return text;
         return self.arena.dupe(u8, text) catch noMemory();
     }
 
@@ -547,7 +570,7 @@ fn builtin(name: [*:0]const u8) ?*py.PyObject {
 }
 
 fn moduleExec(module: [*c]py.PyObject) callconv(.c) c_int {
-    const st = State.of(module);
+    const st: *State = @ptrCast(@alignCast(py.PyModule_GetState(module) orelse return -1));
     st.none_obj = py.Py_BuildValue("") orelse return -1;
     st.true_obj = py.PyBool_FromLong(1) orelse return -1;
     st.false_obj = py.PyBool_FromLong(0) orelse return -1;
@@ -555,6 +578,7 @@ fn moduleExec(module: [*c]py.PyObject) callconv(.c) c_int {
     st.type_error = builtin("TypeError") orelse return -1;
     st.runtime_error = builtin("RuntimeError") orelse return -1;
     st.float_type = builtin("float") orelse return -1;
+    // Set last: State.of() treats a non-null yaml_error as "fully initialized".
     st.yaml_error = py.PyErr_NewException("zaml.YAMLError", st.value_error, null) orelse return -1;
     return py.PyModule_AddObjectRef(module, "YAMLError", st.yaml_error);
 }
@@ -654,7 +678,8 @@ fn moduleDef(slots: [*c]py.PyModuleDef_Slot) py.PyModuleDef {
 
 var module_def_310 = moduleDef(&slots_310);
 var module_def_312 = moduleDef(&slots_312);
-var def_ref_taken = std.atomic.Value(bool).init(false);
+/// One-time setup of the chosen definition: 0 = not started, 1 = running, 2 = done.
+var def_setup = std.atomic.Value(u8).init(0);
 
 /// The running interpreter's minor version, from Py_GetVersion() ("3.12.5 ...").
 fn runtimeMinorVersion() u32 {
@@ -669,9 +694,19 @@ fn runtimeMinorVersion() u32 {
 
 pub export fn PyInit__zaml() callconv(.c) ?*py.PyObject {
     const def = if (runtimeMinorVersion() >= 12) &module_def_312 else &module_def_310;
-    // Equivalent of PyModuleDef_HEAD_INIT: the definition holds one reference.
-    // Imports in interpreters with their own GIL can run concurrently, so
-    // exactly one of them takes it.
-    if (!def_ref_taken.swap(true, .acq_rel)) py.Py_IncRef(@ptrCast(def));
+    // The first import sets the shared definition up: one reference (the
+    // equivalent of PyModuleDef_HEAD_INIT) and PyModuleDef_Init's writes of its
+    // type and index. Interpreters with their own GIL can import concurrently,
+    // so exactly one does this while any others wait; afterwards
+    // PyModuleDef_Init only returns the definition.
+    if (def_setup.load(.acquire) != 2) {
+        if (def_setup.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+            py.Py_IncRef(@ptrCast(def));
+            _ = py.PyModuleDef_Init(def);
+            def_setup.store(2, .release);
+        } else {
+            while (def_setup.load(.acquire) != 2) std.atomic.spinLoopHint();
+        }
+    }
     return py.PyModuleDef_Init(def);
 }

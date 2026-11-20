@@ -633,3 +633,89 @@ def _yaml_error_id():
     import zaml
 
     return id(zaml.YAMLError)
+
+
+# ---------------------------------------------------------------------------
+# Regressions found in the second review
+
+import subprocess
+import sys
+
+
+def test_dump_all_snapshots_a_reused_document():
+    # Like PyYAML: each document is written as it was when yielded.
+    def updates():
+        doc = {"n": 0, "label": "start"}
+        for i in range(3):
+            doc["n"] = i
+            doc["label"] = "".join(["step-", str(i), "-", "x" * 1000])
+            yield doc
+
+    assert zaml.load_all(zaml.dump_all(updates())) == [
+        {"n": i, "label": f"step-{i}-" + "x" * 1000} for i in range(3)
+    ]
+
+
+def test_float_check_does_not_consult_class():
+    # A non-container reaches the float check before default= is called;
+    # isinstance() there would consult __class__.
+    consulted = []
+
+    class Probe:
+        @property
+        def __class__(self):  # pyright: ignore[reportIncompatibleMethodOverride]
+            consulted.append(True)
+            return float
+
+    assert zaml.dump([Probe()], default=lambda obj: "probe") == "- probe\n"
+    with pytest.raises(TypeError, match="Probe"):
+        zaml.dump(Probe())
+    assert consulted == []
+
+
+def test_functions_before_module_execution_raise():
+    # importlib can create the module without executing it; calling its
+    # functions then must raise, not crash the interpreter.
+    code = """
+import importlib.util
+spec = importlib.util.find_spec("zaml._zaml")
+mod = importlib.util.module_from_spec(spec)
+for call in (lambda: mod.load("a:"), lambda: mod.load("a: [1"), lambda: mod.dump(None)):
+    try:
+        call()
+    except RuntimeError as e:
+        assert "not initialized" in str(e), e
+    else:
+        raise AssertionError("no RuntimeError")
+print("ok")
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
+def test_concurrent_first_imports_in_isolated_interpreters():
+    pytest.importorskip("concurrent.interpreters")  # Python 3.14+
+    # In a fresh process the main interpreter never imports zaml, so the
+    # first imports happen in parallel, each in an interpreter with its own GIL.
+    code = """
+import concurrent.interpreters as ci, threading
+interps = [ci.create() for _ in range(8)]
+barrier = threading.Barrier(len(interps))
+errors = []
+def run(interp):
+    barrier.wait()
+    try:
+        interp.exec("import zaml; assert zaml.load(zaml.dump({'a': [1, None]})) == {'a': [1, None]}")
+    except Exception as e:
+        errors.append(repr(e))
+threads = [threading.Thread(target=run, args=(i,)) for i in interps]
+for t in threads: t.start()
+for t in threads: t.join()
+for i in interps: i.close()
+print("errors:", errors)
+"""
+    for _ in range(3):
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "errors: []"
