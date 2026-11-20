@@ -308,7 +308,14 @@ fn dumpDocuments(args: *py.PyObject, kwargs: ?*py.PyObject, mode: Mode) PyError!
 
     const result = switch (mode) {
         .first => yaml.emit(&out.writer, try dumper.value(data.?, 0), options),
-        .all => yaml.emitStream(&out.writer, try dumper.values(data.?), options),
+        .all => blk: {
+            // Collect the documents first: an iterator's documents may be
+            // referenced nowhere else, and the value tree borrows their
+            // strings until emitStream has written them.
+            const documents = try check(py.PySequence_List(data.?));
+            defer py.Py_DecRef(documents);
+            break :blk yaml.emitStream(&out.writer, try dumper.values(documents), options);
+        },
     };
     result catch |err| return raiseDumpError(err);
 
@@ -335,16 +342,15 @@ const Dumper = struct {
     arena: std.mem.Allocator,
     default: ?*py.PyObject,
 
+    /// `documents` is a list zaml owns, which keeps every document alive.
     fn values(self: Dumper, documents: *py.PyObject) PyError![]yaml.Value {
-        const iter = py.PyObject_GetIter(documents) orelse return error.PythonError;
-        defer py.Py_DecRef(iter);
-        var list: std.ArrayList(yaml.Value) = .empty;
-        while (py.PyIter_Next(iter)) |doc| {
-            defer py.Py_DecRef(doc);
-            list.append(self.arena, try self.value(doc, 0)) catch return noMemory();
+        const len: usize = @intCast(py.PyList_Size(documents));
+        const items = self.arena.alloc(yaml.Value, len) catch return noMemory();
+        for (items, 0..) |*item, i| {
+            const doc = py.PyList_GetItem(documents, @intCast(i)) orelse return error.PythonError;
+            item.* = try self.value(doc, 0);
         }
-        if (py.PyErr_Occurred() != null) return error.PythonError;
-        return list.items;
+        return items;
     }
 
     fn value(self: Dumper, obj: *py.PyObject, depth: usize) PyError!yaml.Value {
@@ -357,9 +363,9 @@ const Dumper = struct {
         if (obj == false_obj) return .{ .bool = false };
         if (py.PyUnicode_Check(obj) != 0) return .{ .string = try self.string(obj) };
         if (py.PyLong_Check(obj) != 0) return .{ .int = try toInt(obj) };
-        if (py.PyObject_IsInstance(obj, float_type) == 1) return .{ .float = py.PyFloat_AsDouble(obj) };
         if (py.PyDict_Check(obj) != 0) return self.map(obj, depth);
         if (py.PyList_Check(obj) != 0 or py.PyTuple_Check(obj) != 0) return self.seq(obj, depth);
+        if (isFloat(obj)) return .{ .float = py.PyFloat_AsDouble(obj) };
 
         const default = self.default orelse return typeError("cannot dump objects of type", obj);
         const call_args = try check(py.PyTuple_Pack(1, obj));
@@ -431,6 +437,14 @@ const Dumper = struct {
 fn changedDuringDump() PyError {
     py.PyErr_SetString(runtime_error, "dictionary changed size during dump");
     return error.PythonError;
+}
+
+/// Whether obj's real type is float or a subclass. Unlike isinstance(), this
+/// never consults obj.__class__, which can run Python code and fail.
+fn isFloat(obj: *py.PyObject) bool {
+    const obj_type = py.PyObject_Type(obj) orelse return false; // cannot fail for a live object
+    defer py.Py_DecRef(obj_type);
+    return py.PyType_IsSubtype(@ptrCast(obj_type), @ptrCast(float_type)) != 0;
 }
 
 fn utf8(obj: *py.PyObject) PyError![]const u8 {

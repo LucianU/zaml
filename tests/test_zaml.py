@@ -541,3 +541,63 @@ def test_long_keys_are_not_cached_but_load():
 def test_duplicate_key_error_with_cached_keys():
     with pytest.raises(zaml.YAMLError, match="duplicate"):
         zaml.load("- {a: 1}\n- {a: 1, b: 2, a: 3}\n")
+
+
+# ---------------------------------------------------------------------------
+# Regressions found in review: objects freed or Python code run mid-dump
+
+
+def _fresh_documents():
+    # Every document and string is created here and referenced nowhere else.
+    for i in range(50):
+        yield {"name": "".join(["document-", str(i), "-", "x" * 2000]), "items": [f"item-{i}"] * 3}
+
+
+def test_dump_all_generator_documents_are_kept_alive():
+    assert zaml.load_all(zaml.dump_all(_fresh_documents())) == list(_fresh_documents())
+
+
+def test_dump_all_generator_of_bare_strings():
+    def strings():
+        for i in range(50):
+            yield "".join(["string-", str(i), "-", "y" * 2000])
+
+    assert zaml.load_all(zaml.dump_all(strings())) == list(strings())
+
+
+def test_dump_all_generator_with_default():
+    def docs():
+        for i in range(20):
+            yield {"tags": {f"t{i}-" + "z" * 500}}
+
+    assert zaml.load_all(zaml.dump_all(docs(), default=sorted)) == [
+        {"tags": [f"t{i}-" + "z" * 500]} for i in range(20)
+    ]
+
+
+def test_dump_does_not_consult_overridden_class():
+    # isinstance() would call this property, which frees the string dumped
+    # before it; zaml must check the real type instead.
+    data = []
+
+    class Trigger(dict):
+        @property
+        def __class__(self):  # pyright: ignore[reportIncompatibleMethodOverride]
+            data[0] = None
+            # Reuse the freed memory, so a dangling pointer reads other bytes.
+            self.churn = ["y" * 20020 for _ in range(100)]
+            return dict
+
+    first = "".join(["DYNAMIC_STRING_", "x" * 20000])
+    data.extend([first, Trigger(a=1)])
+    del first
+    assert zaml.load(zaml.dump(data)) == ["DYNAMIC_STRING_" + "x" * 20000, {"a": 1}]
+
+
+def test_dump_ignores_class_property_that_raises():
+    class Bad(dict):
+        @property
+        def __class__(self):  # pyright: ignore[reportIncompatibleMethodOverride]
+            raise RuntimeError("must not be called")
+
+    assert zaml.load(zaml.dump([Bad(a=1)])) == [{"a": 1}]
